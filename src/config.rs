@@ -2,6 +2,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -17,10 +18,25 @@ pub struct Config {
     pub upstream_api_key: Option<String>,
     pub upstream_model: Option<String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    pub model_profiles: BTreeMap<String, ModelProfile>,
     pub brave_base_url: Url,
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
     pub request_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PersistedModelProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
+    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelProfile {
+    pub upstream_model: Option<String>,
+    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -33,6 +49,8 @@ pub struct PersistedConfig {
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_profiles: BTreeMap<String, PersistedModelProfile>,
     pub brave_base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brave_api_key: Option<String>,
@@ -48,6 +66,7 @@ impl Default for PersistedConfig {
             upstream_api_key: None,
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: BTreeMap::new(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -90,6 +109,27 @@ impl Config {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
+            model_profiles: config
+                .model_profiles
+                .iter()
+                .filter_map(|(name, profile)| {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        name.to_string(),
+                        ModelProfile {
+                            upstream_model: profile
+                                .upstream_model
+                                .as_ref()
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty()),
+                            upstream_chat_kwargs: profile.upstream_chat_kwargs.clone(),
+                        },
+                    ))
+                })
+                .collect(),
             brave_base_url,
             brave_api_key: config
                 .brave_api_key
@@ -99,6 +139,22 @@ impl Config {
             brave_max_results: config.brave_max_results,
             request_timeout: Duration::from_secs(config.request_timeout_secs),
         })
+    }
+
+    pub fn resolve_upstream_model(&self, request_model: &str) -> String {
+        self.model_profiles
+            .get(request_model)
+            .and_then(|profile| profile.upstream_model.clone())
+            .or_else(|| self.upstream_model.clone())
+            .unwrap_or_else(|| request_model.to_string())
+    }
+
+    pub fn resolve_upstream_chat_kwargs(&self, request_model: &str) -> JsonMap<String, JsonValue> {
+        let mut kwargs = self.upstream_chat_kwargs.clone();
+        if let Some(profile) = self.model_profiles.get(request_model) {
+            merge_json_maps(&mut kwargs, &profile.upstream_chat_kwargs);
+        }
+        kwargs
     }
 }
 
@@ -188,14 +244,35 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     }
 }
 
+pub fn merge_json_maps(
+    destination: &mut JsonMap<String, JsonValue>,
+    source: &JsonMap<String, JsonValue>,
+) {
+    for (key, source_value) in source {
+        match (destination.get_mut(key), source_value) {
+            (Some(JsonValue::Object(destination_object)), JsonValue::Object(source_object)) => {
+                merge_json_maps(destination_object, source_object);
+            }
+            _ => {
+                destination.insert(key.clone(), source_value.clone());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::Config;
     use super::JsonMap;
     use super::JsonValue;
     use super::PersistedConfig;
+    use super::PersistedModelProfile;
     use super::load_persisted_config;
+    use super::merge_json_maps;
     use super::write_persisted_config;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn persisted_config_roundtrips() {
@@ -212,6 +289,19 @@ mod tests {
                 "clear_thinking".to_string(),
                 JsonValue::Bool(false),
             )]),
+            model_profiles: BTreeMap::from_iter([(
+                "Kimi-K2.6".to_string(),
+                PersistedModelProfile {
+                    upstream_model: None,
+                    upstream_chat_kwargs: JsonMap::from_iter([(
+                        "chat_template_kwargs".to_string(),
+                        json!({
+                            "thinking": true,
+                            "preserve_thinking": true
+                        }),
+                    )]),
+                },
+            )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: Some("secret".to_string()),
             brave_max_results: 7,
@@ -221,5 +311,88 @@ mod tests {
         let loaded = load_persisted_config(&path).expect("load config");
         assert_eq!(loaded, config);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolves_profile_specific_upstream_chat_kwargs() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: BTreeMap::from_iter([(
+                "Kimi-K2.6".to_string(),
+                PersistedModelProfile {
+                    upstream_model: None,
+                    upstream_chat_kwargs: JsonMap::from_iter([(
+                        "chat_template_kwargs".to_string(),
+                        json!({
+                            "thinking": true,
+                            "preserve_thinking": true
+                        }),
+                    )]),
+                },
+            )]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+        })
+        .expect("config");
+
+        assert_eq!(
+            config.resolve_upstream_model("Kimi-K2.6"),
+            "Kimi-K2.6".to_string()
+        );
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("Kimi-K2.6"),
+            JsonMap::from_iter([(
+                "chat_template_kwargs".to_string(),
+                json!({
+                    "thinking": true,
+                    "preserve_thinking": true
+                }),
+            )])
+        );
+    }
+
+    #[test]
+    fn merges_nested_profile_chat_kwargs() {
+        let mut destination = JsonMap::from_iter([
+            (
+                "chat_template_kwargs".to_string(),
+                json!({
+                    "enable_thinking": true,
+                    "clear_thinking": false
+                }),
+            ),
+            ("stream_reasoning".to_string(), JsonValue::Bool(true)),
+        ]);
+        let source = JsonMap::from_iter([(
+            "chat_template_kwargs".to_string(),
+            json!({
+                "thinking": true,
+                "preserve_thinking": true
+            }),
+        )]);
+
+        merge_json_maps(&mut destination, &source);
+
+        assert_eq!(
+            destination,
+            JsonMap::from_iter([
+                (
+                    "chat_template_kwargs".to_string(),
+                    json!({
+                        "enable_thinking": true,
+                        "clear_thinking": false,
+                        "thinking": true,
+                        "preserve_thinking": true
+                    }),
+                ),
+                ("stream_reasoning".to_string(), JsonValue::Bool(true)),
+            ])
+        );
     }
 }

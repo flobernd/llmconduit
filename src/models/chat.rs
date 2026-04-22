@@ -75,7 +75,32 @@ pub struct ChatFunctionCall {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionChunk {
     pub id: String,
+    #[serde(default)]
+    pub usage: Option<ChatCompletionUsage>,
     pub choices: Vec<ChatChunkChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ChatCompletionUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<ChatPromptTokensDetails>,
+    #[serde(default)]
+    pub completion_tokens_details: Option<ChatCompletionTokensDetails>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ChatPromptTokensDetails {
+    pub cached_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ChatCompletionTokensDetails {
+    pub reasoning_tokens: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

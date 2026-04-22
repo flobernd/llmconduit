@@ -1,0 +1,714 @@
+use crate::engine::SseEvent;
+use crate::models::anthropic::AnthropicContentBlockStart;
+use crate::models::anthropic::AnthropicDelta;
+use crate::models::anthropic::AnthropicErrorBody;
+use crate::models::anthropic::AnthropicMessageDeltaBody;
+use crate::models::anthropic::AnthropicMessageResponse;
+use crate::models::anthropic::AnthropicMessageStart;
+use crate::models::anthropic::AnthropicMessageUsage;
+use crate::models::anthropic::AnthropicResponseContentBlock;
+use crate::models::anthropic::AnthropicStreamEvent;
+use crate::models::anthropic::AnthropicUsage;
+use serde_json::Value;
+use uuid::Uuid;
+
+enum ContentBlockState {
+    Thinking { index: usize },
+    Text { index: usize },
+}
+
+pub struct AnthropicStreamConverter {
+    model: String,
+    message_id: String,
+    next_block_index: usize,
+    open_block: Option<ContentBlockState>,
+    has_tool_calls: bool,
+    started: bool,
+}
+
+impl AnthropicStreamConverter {
+    pub fn new(model: String) -> Self {
+        Self {
+            model,
+            message_id: format!("msg_{}", Uuid::new_v4().simple()),
+            next_block_index: 0,
+            open_block: None,
+            has_tool_calls: false,
+            started: false,
+        }
+    }
+
+    pub fn convert(&mut self, event: &SseEvent) -> Vec<AnthropicStreamEvent> {
+        let mut output = Vec::new();
+        match event.event.as_str() {
+            "response.created" => self.handle_created(&mut output),
+            "response.output_item.added" => self.handle_item_added(&event.data, &mut output),
+            "response.output_text.delta" => self.handle_text_delta(&event.data, &mut output),
+            "response.reasoning_text.delta" => {
+                self.handle_reasoning_delta(&event.data, &mut output);
+            }
+            "response.output_item.done" => self.handle_item_done(&event.data, &mut output),
+            "response.completed" => self.handle_completed(&mut output),
+            "response.failed" => self.handle_failed(&event.data, &mut output),
+            _ => {}
+        }
+        output
+    }
+
+    fn ensure_started(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+        if !self.started {
+            self.started = true;
+            output.push(AnthropicStreamEvent::Ping);
+            output.push(AnthropicStreamEvent::MessageStart {
+                message: AnthropicMessageStart {
+                    id: self.message_id.clone(),
+                    kind: "message".to_string(),
+                    role: "assistant".to_string(),
+                    content: Vec::new(),
+                    model: self.model.clone(),
+                    stop_reason: None,
+                    stop_sequence: None,
+                    usage: AnthropicUsage { output_tokens: 0 },
+                },
+            });
+        }
+    }
+
+    fn handle_created(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+        self.ensure_started(output);
+    }
+
+    fn handle_item_added(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        self.ensure_started(output);
+        let Some(item) = data.get("item") else { return };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match item_type {
+            "message" => {
+                self.close_open_block(output);
+                self.start_text_block(output);
+            }
+            "reasoning" => {
+                self.close_open_block(output);
+                self.start_thinking_block(output);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_text_delta(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        self.ensure_started(output);
+        let Some(delta) = data.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        match self.open_block {
+            Some(ContentBlockState::Text { index }) => {
+                output.push(AnthropicStreamEvent::ContentBlockDelta {
+                    index,
+                    delta: AnthropicDelta::TextDelta {
+                        text: delta.to_string(),
+                    },
+                });
+            }
+            _ => {
+                self.close_open_block(output);
+                self.start_text_block(output);
+                if let Some(ContentBlockState::Text { index }) = self.open_block {
+                    output.push(AnthropicStreamEvent::ContentBlockDelta {
+                        index,
+                        delta: AnthropicDelta::TextDelta {
+                            text: delta.to_string(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    fn handle_reasoning_delta(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        self.ensure_started(output);
+        let Some(delta) = data.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        match self.open_block {
+            Some(ContentBlockState::Thinking { index }) => {
+                output.push(AnthropicStreamEvent::ContentBlockDelta {
+                    index,
+                    delta: AnthropicDelta::ThinkingDelta {
+                        thinking: delta.to_string(),
+                    },
+                });
+            }
+            _ => {
+                self.close_open_block(output);
+                self.start_thinking_block(output);
+                if let Some(ContentBlockState::Thinking { index }) = self.open_block {
+                    output.push(AnthropicStreamEvent::ContentBlockDelta {
+                        index,
+                        delta: AnthropicDelta::ThinkingDelta {
+                            thinking: delta.to_string(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    fn handle_item_done(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        let Some(item) = data.get("item") else { return };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match item_type {
+            "message" => {
+                if matches!(self.open_block, Some(ContentBlockState::Text { .. })) {
+                    self.close_open_block(output);
+                }
+            }
+            "reasoning" => {
+                if matches!(self.open_block, Some(ContentBlockState::Thinking { .. })) {
+                    self.close_open_block(output);
+                }
+            }
+            "function_call" | "custom_tool_call" => {
+                self.close_open_block(output);
+                self.emit_tool_use_block(item, output);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_completed(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+        self.close_open_block(output);
+        let stop_reason = if self.has_tool_calls {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+        output.push(AnthropicStreamEvent::MessageDelta {
+            delta: AnthropicMessageDeltaBody {
+                stop_reason: stop_reason.to_string(),
+                stop_sequence: None,
+            },
+            usage: AnthropicUsage { output_tokens: 0 },
+        });
+        output.push(AnthropicStreamEvent::MessageStop);
+    }
+
+    fn handle_failed(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        let message = data
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("gateway error")
+            .to_string();
+        output.push(AnthropicStreamEvent::Error {
+            error: AnthropicErrorBody {
+                kind: "api_error".to_string(),
+                message,
+            },
+        });
+    }
+
+    fn close_open_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+        if let Some(block) = self.open_block.take() {
+            let index = match block {
+                ContentBlockState::Thinking { index } | ContentBlockState::Text { index } => index,
+            };
+            output.push(AnthropicStreamEvent::ContentBlockStop { index });
+        }
+    }
+
+    fn start_text_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        self.open_block = Some(ContentBlockState::Text { index });
+        output.push(AnthropicStreamEvent::ContentBlockStart {
+            index,
+            content_block: AnthropicContentBlockStart::Text {
+                text: String::new(),
+            },
+        });
+    }
+
+    fn start_thinking_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        self.open_block = Some(ContentBlockState::Thinking { index });
+        output.push(AnthropicStreamEvent::ContentBlockStart {
+            index,
+            content_block: AnthropicContentBlockStart::Thinking {
+                thinking: String::new(),
+            },
+        });
+    }
+
+    fn emit_tool_use_block(&mut self, item: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        self.has_tool_calls = true;
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+
+        output.push(AnthropicStreamEvent::ContentBlockStart {
+            index,
+            content_block: AnthropicContentBlockStart::ToolUse {
+                id: call_id.to_string(),
+                name: name.to_string(),
+                input: Value::Object(Default::default()),
+            },
+        });
+        output.push(AnthropicStreamEvent::ContentBlockDelta {
+            index,
+            delta: AnthropicDelta::InputJsonDelta {
+                partial_json: arguments.to_string(),
+            },
+        });
+        output.push(AnthropicStreamEvent::ContentBlockStop { index });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming collector: accumulates stream events into a single response
+// ---------------------------------------------------------------------------
+
+enum AccumulatedBlock {
+    Thinking {
+        text: String,
+    },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+}
+
+pub struct AnthropicStreamCollector {
+    inner: AnthropicStreamConverter,
+    message_id: Option<String>,
+    model: Option<String>,
+    stop_reason: Option<String>,
+    blocks: Vec<AccumulatedBlock>,
+    current_block: Option<AccumulatedBlock>,
+    output_tokens: u64,
+    error: Option<AnthropicErrorBody>,
+}
+
+impl AnthropicStreamCollector {
+    pub fn new(model: String) -> Self {
+        Self {
+            inner: AnthropicStreamConverter::new(model.clone()),
+            message_id: None,
+            model: Some(model),
+            stop_reason: None,
+            blocks: Vec::new(),
+            current_block: None,
+            output_tokens: 0,
+            error: None,
+        }
+    }
+
+    pub fn process(&mut self, event: &SseEvent) {
+        let stream_events = self.inner.convert(event);
+        for se in stream_events {
+            match se {
+                AnthropicStreamEvent::MessageStart { message } => {
+                    self.message_id = Some(message.id);
+                    self.output_tokens = message.usage.output_tokens;
+                }
+                AnthropicStreamEvent::ContentBlockStart { content_block, .. } => {
+                    self.current_block = match content_block {
+                        AnthropicContentBlockStart::Text { .. } => Some(AccumulatedBlock::Text {
+                            text: String::new(),
+                        }),
+                        AnthropicContentBlockStart::Thinking { .. } => {
+                            Some(AccumulatedBlock::Thinking {
+                                text: String::new(),
+                            })
+                        }
+                        AnthropicContentBlockStart::ToolUse { id, name, .. } => {
+                            Some(AccumulatedBlock::ToolUse {
+                                id,
+                                name,
+                                input: String::new(),
+                            })
+                        }
+                    };
+                }
+                AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
+                    match (&mut self.current_block, delta) {
+                        (
+                            Some(AccumulatedBlock::Text { text }),
+                            AnthropicDelta::TextDelta { text: t },
+                        ) => {
+                            text.push_str(&t);
+                        }
+                        (
+                            Some(AccumulatedBlock::Thinking { text }),
+                            AnthropicDelta::ThinkingDelta { thinking: t },
+                        ) => {
+                            text.push_str(&t);
+                        }
+                        (
+                            Some(AccumulatedBlock::ToolUse { input, .. }),
+                            AnthropicDelta::InputJsonDelta { partial_json },
+                        ) => {
+                            input.push_str(&partial_json);
+                        }
+                        _ => {}
+                    }
+                }
+                AnthropicStreamEvent::ContentBlockStop { .. } => {
+                    if let Some(block) = self.current_block.take() {
+                        self.blocks.push(block);
+                    }
+                }
+                AnthropicStreamEvent::MessageDelta { delta, usage } => {
+                    self.stop_reason = Some(delta.stop_reason);
+                    self.output_tokens = usage.output_tokens;
+                }
+                AnthropicStreamEvent::Error { error } => {
+                    self.error = Some(error);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn into_response(self) -> Result<AnthropicMessageResponse, AnthropicErrorBody> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+
+        let content: Vec<AnthropicResponseContentBlock> = self
+            .blocks
+            .into_iter()
+            .map(|block| match block {
+                AccumulatedBlock::Text { text } => AnthropicResponseContentBlock::Text { text },
+                AccumulatedBlock::Thinking { text } => {
+                    AnthropicResponseContentBlock::Thinking { thinking: text }
+                }
+                AccumulatedBlock::ToolUse { id, name, input } => {
+                    let parsed_input: Value =
+                        serde_json::from_str(&input).unwrap_or(Value::Object(Default::default()));
+                    AnthropicResponseContentBlock::ToolUse {
+                        id,
+                        name,
+                        input: parsed_input,
+                    }
+                }
+            })
+            .collect();
+
+        Ok(AnthropicMessageResponse {
+            id: self
+                .message_id
+                .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple())),
+            kind: "message".to_string(),
+            role: "assistant".to_string(),
+            content,
+            model: self.model.unwrap_or_default(),
+            stop_reason: self.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+            stop_sequence: None,
+            usage: AnthropicMessageUsage {
+                input_tokens: 0,
+                output_tokens: self.output_tokens,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::anthropic::AnthropicStreamEvent;
+    use serde_json::json;
+
+    fn created_event() -> SseEvent {
+        SseEvent {
+            event: "response.created".to_string(),
+            data: json!({
+                "type": "response.created",
+                "response": { "id": "resp_123" }
+            }),
+        }
+    }
+
+    fn item_added_event(item_type: &str, role: &str) -> SseEvent {
+        SseEvent {
+            event: "response.output_item.added".to_string(),
+            data: json!({
+                "type": "response.output_item.added",
+                "item": { "type": item_type, "role": role }
+            }),
+        }
+    }
+
+    fn text_delta_event(text: &str) -> SseEvent {
+        SseEvent {
+            event: "response.output_text.delta".to_string(),
+            data: json!({
+                "type": "response.output_text.delta",
+                "delta": text
+            }),
+        }
+    }
+
+    fn reasoning_delta_event(text: &str) -> SseEvent {
+        SseEvent {
+            event: "response.reasoning_text.delta".to_string(),
+            data: json!({
+                "type": "response.reasoning_text.delta",
+                "delta": text,
+                "content_index": 0
+            }),
+        }
+    }
+
+    fn item_done_event(item_type: &str, extra: Value) -> SseEvent {
+        let mut item = serde_json::json!({ "type": item_type });
+        if let Value::Object(map) = extra {
+            for (k, v) in map {
+                item.as_object_mut().unwrap().insert(k, v);
+            }
+        }
+        SseEvent {
+            event: "response.output_item.done".to_string(),
+            data: json!({
+                "type": "response.output_item.done",
+                "item": item
+            }),
+        }
+    }
+
+    fn completed_event() -> SseEvent {
+        SseEvent {
+            event: "response.completed".to_string(),
+            data: json!({
+                "type": "response.completed",
+                "response": { "id": "resp_123" }
+            }),
+        }
+    }
+
+    fn failed_event(message: &str) -> SseEvent {
+        SseEvent {
+            event: "response.failed".to_string(),
+            data: json!({
+                "type": "response.failed",
+                "response": {
+                    "error": { "code": "gateway_error", "message": message }
+                }
+            }),
+        }
+    }
+
+    fn event_types(events: &[AnthropicStreamEvent]) -> Vec<&str> {
+        events.iter().map(|e| e.sse_event_type()).collect()
+    }
+
+    #[test]
+    fn converts_simple_text_response() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Hello"),
+            text_delta_event(" world"),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        assert_eq!(
+            event_types(&events),
+            vec![
+                "ping",
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+    }
+
+    #[test]
+    fn converts_reasoning_then_text_response() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("Thinking..."),
+            item_added_event("message", "assistant"),
+            text_delta_event("Answer"),
+            item_done_event("reasoning", json!({})),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        assert_eq!(
+            event_types(&events),
+            vec![
+                "ping",
+                "message_start",
+                "content_block_start", // thinking
+                "content_block_delta", // thinking delta
+                "content_block_stop",  // close thinking before text
+                "content_block_start", // text
+                "content_block_delta", // text delta
+                "content_block_stop",  // close text
+                "message_delta",
+                "message_stop",
+            ]
+        );
+    }
+
+    #[test]
+    fn converts_function_call_response() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Let me check."),
+            item_done_event("message", json!({})),
+            item_done_event(
+                "function_call",
+                json!({
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Seattle\"}"
+                }),
+            ),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        assert_eq!(
+            event_types(&events),
+            vec![
+                "ping",
+                "message_start",
+                "content_block_start", // text
+                "content_block_delta", // text delta
+                "content_block_stop",  // close text
+                "content_block_start", // tool_use
+                "content_block_delta", // input_json_delta
+                "content_block_stop",  // close tool_use
+                "message_delta",
+                "message_stop",
+            ]
+        );
+
+        // Verify stop_reason is tool_use
+        let message_delta = events
+            .iter()
+            .find(|e| matches!(e, AnthropicStreamEvent::MessageDelta { .. }));
+        assert!(message_delta.is_some());
+    }
+
+    #[test]
+    fn converts_tool_use_only_response() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_done_event(
+                "function_call",
+                json!({
+                    "call_id": "call_1",
+                    "name": "search",
+                    "arguments": "{\"query\":\"test\"}"
+                }),
+            ),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        // Should have tool_use block with tool_use stop_reason
+        let has_tool_use = events.iter().any(|e| {
+            matches!(
+                e,
+                AnthropicStreamEvent::ContentBlockStart {
+                    content_block: AnthropicContentBlockStart::ToolUse { .. },
+                    ..
+                }
+            )
+        });
+        assert!(has_tool_use);
+    }
+
+    #[test]
+    fn converts_failure_event() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events = converter.convert(&failed_event("upstream timeout"));
+
+        assert_eq!(event_types(&events), vec!["error"]);
+    }
+
+    #[test]
+    fn skips_web_search_call_events() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Searching..."),
+            item_done_event("message", json!({})),
+            // web_search_call events should be skipped
+            SseEvent {
+                event: "response.output_item.added".to_string(),
+                data: json!({
+                    "type": "response.output_item.added",
+                    "item": { "type": "web_search_call", "id": "ws_1", "status": "in_progress" }
+                }),
+            },
+            SseEvent {
+                event: "response.output_item.done".to_string(),
+                data: json!({
+                    "type": "response.output_item.done",
+                    "item": { "type": "web_search_call", "id": "ws_1", "status": "completed" }
+                }),
+            },
+            // After internal web search, more text comes in a new turn
+            // (simulated by another item_added + delta)
+            item_added_event("message", "assistant"),
+            text_delta_event("Here are the results."),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        // No tool_use events should appear for web_search_call
+        let has_web_search_tool_use = events.iter().any(|e| {
+            matches!(
+                e,
+                AnthropicStreamEvent::ContentBlockStart {
+                    content_block: AnthropicContentBlockStart::ToolUse { name, .. },
+                    ..
+                } if name == "web_search"
+            )
+        });
+        assert!(!has_web_search_tool_use);
+    }
+}

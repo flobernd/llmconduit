@@ -47,3 +47,7 @@ pub fn build_app_with_gateway(config: Config) -> (axum::Router, Arc<Gateway>) {
     let app = build_router(Arc::clone(&gateway));
     (app, gateway)
 }
+
+pub fn build_app_from_gateway(gateway: Arc<Gateway>) -> axum::Router {
+    build_router(gateway)
+}

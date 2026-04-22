@@ -141,6 +141,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         upstream_api_key,
         upstream_model: (!upstream_model.trim().is_empty()).then_some(upstream_model),
         upstream_chat_kwargs,
+        model_profiles: existing.model_profiles.clone(),
         brave_base_url,
         brave_api_key: (!brave_api_key.trim().is_empty()).then_some(brave_api_key),
         brave_max_results,

@@ -137,6 +137,7 @@ mod tests {
                 upstream_api_key: None,
                 upstream_model: None,
                 upstream_chat_kwargs: serde_json::Map::new(),
+                model_profiles: std::collections::BTreeMap::new(),
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1")
                     .expect("url"),
                 brave_api_key: Some("secret".to_string()),
@@ -164,6 +165,7 @@ mod tests {
                 upstream_api_key: None,
                 upstream_model: None,
                 upstream_chat_kwargs: serde_json::Map::new(),
+                model_profiles: std::collections::BTreeMap::new(),
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1/")
                     .expect("url"),
                 brave_api_key: Some("secret".to_string()),

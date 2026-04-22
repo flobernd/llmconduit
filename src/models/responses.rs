@@ -292,6 +292,26 @@ pub struct ResponseCompletedPayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseCompleted {
     pub id: String,
+    pub usage: Option<ResponseUsage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseUsage {
+    pub input_tokens: u64,
+    pub input_tokens_details: Option<ResponseInputTokensDetails>,
+    pub output_tokens: u64,
+    pub output_tokens_details: Option<ResponseOutputTokensDetails>,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseInputTokensDetails {
+    pub cached_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseOutputTokensDetails {
+    pub reasoning_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

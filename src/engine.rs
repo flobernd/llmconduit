@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionRequest;
+use crate::models::chat::ChatCompletionUsage;
 use crate::models::chat::ChatMessage;
 use crate::models::responses::DeltaPayload;
 use crate::models::responses::FailedError;
@@ -18,8 +19,11 @@ use crate::models::responses::ReasoningDeltaPayload;
 use crate::models::responses::ResponseCompleted;
 use crate::models::responses::ResponseCompletedPayload;
 use crate::models::responses::ResponseCreatedPayload;
+use crate::models::responses::ResponseInputTokensDetails;
 use crate::models::responses::ResponseItem;
+use crate::models::responses::ResponseOutputTokensDetails;
 use crate::models::responses::ResponseStub;
+use crate::models::responses::ResponseUsage;
 use crate::models::responses::ResponsesEnvelope;
 use crate::models::responses::ResponsesRequest;
 use crate::monitor::MonitorEventKind;
@@ -375,13 +379,10 @@ impl Gateway {
             .map_err(|_| AppError::internal("failed to send response.created"))?;
 
         let mut public_history = request.input.clone();
-        let upstream_model = self
-            .config
-            .upstream_model
-            .clone()
-            .unwrap_or_else(|| request.model.clone());
+        let upstream_model = self.config.resolve_upstream_model(&request.model);
 
         let mut upstream_request_index = 0usize;
+        let mut final_usage = None;
         loop {
             upstream_request_index += 1;
             let upstream_request = ChatCompletionRequest {
@@ -393,12 +394,12 @@ impl Gateway {
                 parallel_tool_calls: false,
                 reasoning_effort: reasoning_effort.clone(),
                 response_format: response_format.clone(),
-                extra_body: self
-                    .config
-                    .upstream_chat_kwargs
-                    .clone()
-                    .into_iter()
-                    .collect(),
+                extra_body: force_stream_usage(
+                    self.config
+                        .resolve_upstream_chat_kwargs(&request.model)
+                        .into_iter()
+                        .collect(),
+                ),
             };
             self.monitor.emit(
                 response_id.clone(),
@@ -476,6 +477,9 @@ impl Gateway {
             let mut state = StreamState::default();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
+                if let Some(usage) = chunk.usage.clone() {
+                    final_usage = Some(usage);
+                }
                 for emission in state.apply_chunk(&chunk) {
                     match emission {
                         StreamEmission::OutputItemAdded(item) => {
@@ -567,7 +571,7 @@ impl Gateway {
             })
             .await;
 
-        tx.send(completed_event(&response_id))
+        tx.send(completed_event(&response_id, final_usage.as_ref()))
             .await
             .map_err(|_| AppError::internal("failed to send response.completed"))?;
         self.monitor.emit(response_id, MonitorEventKind::Completed);
@@ -908,7 +912,7 @@ fn created_event(response_id: &str) -> SseEvent {
     )
 }
 
-fn completed_event(response_id: &str) -> SseEvent {
+fn completed_event(response_id: &str, usage: Option<&ChatCompletionUsage>) -> SseEvent {
     json_event(
         "response.completed",
         ResponsesEnvelope {
@@ -916,10 +920,51 @@ fn completed_event(response_id: &str) -> SseEvent {
             payload: ResponseCompletedPayload {
                 response: ResponseCompleted {
                     id: response_id.to_string(),
+                    usage: usage.map(response_usage_from_chat_usage),
                 },
             },
         },
     )
+}
+
+fn response_usage_from_chat_usage(usage: &ChatCompletionUsage) -> ResponseUsage {
+    let reasoning_tokens = usage
+        .completion_tokens_details
+        .as_ref()
+        .map(|details| details.reasoning_tokens)
+        .or(usage.reasoning_tokens);
+    ResponseUsage {
+        input_tokens: usage.prompt_tokens,
+        input_tokens_details: usage.prompt_tokens_details.as_ref().map(|details| {
+            ResponseInputTokensDetails {
+                cached_tokens: details.cached_tokens,
+            }
+        }),
+        output_tokens: usage.completion_tokens,
+        output_tokens_details: reasoning_tokens
+            .map(|reasoning_tokens| ResponseOutputTokensDetails { reasoning_tokens }),
+        total_tokens: usage.total_tokens,
+    }
+}
+
+fn force_stream_usage(
+    mut extra_body: std::collections::BTreeMap<String, Value>,
+) -> std::collections::BTreeMap<String, Value> {
+    match extra_body.get_mut("stream_options") {
+        Some(Value::Object(stream_options)) => {
+            stream_options.insert("include_usage".to_string(), Value::Bool(true));
+        }
+        _ => {
+            extra_body.insert(
+                "stream_options".to_string(),
+                Value::Object(serde_json::Map::from_iter([(
+                    "include_usage".to_string(),
+                    Value::Bool(true),
+                )])),
+            );
+        }
+    }
+    extra_body
 }
 
 fn output_item_added_event(item: ResponseItem) -> SseEvent {
