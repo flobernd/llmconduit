@@ -31,6 +31,7 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -43,6 +44,8 @@ use wiremock::matchers::path;
 struct MockUpstream {
     requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
     responses: Arc<Mutex<VecDeque<Vec<Result<ChatCompletionChunk, resp2chat::error::AppError>>>>>,
+    supported_models: Arc<Mutex<Vec<String>>>,
+    supported_model_queries: Arc<Mutex<usize>>,
 }
 
 impl MockUpstream {
@@ -55,6 +58,18 @@ impl MockUpstream {
 
     async fn requests(&self) -> Vec<ChatCompletionRequest> {
         self.requests.lock().await.clone()
+    }
+
+    async fn set_supported_models<I, S>(&self, models: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        *self.supported_models.lock().await = models.into_iter().map(Into::into).collect();
+    }
+
+    async fn supported_model_queries(&self) -> usize {
+        *self.supported_model_queries.lock().await
     }
 }
 
@@ -76,6 +91,72 @@ impl UpstreamClient for MockUpstream {
 
     async fn list_models(&self) -> Result<reqwest::Response, resp2chat::error::AppError> {
         Err(resp2chat::error::AppError::internal("unused in this test"))
+    }
+
+    async fn supported_model_ids(&self) -> Result<Vec<String>, resp2chat::error::AppError> {
+        let mut query_count = self.supported_model_queries.lock().await;
+        *query_count += 1;
+        Ok(self.supported_models.lock().await.clone())
+    }
+}
+
+#[derive(Clone)]
+struct PendingChunkUpstream {
+    requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
+    stream_polled: Arc<Notify>,
+    stream_dropped: Arc<Notify>,
+}
+
+impl PendingChunkUpstream {
+    fn new() -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            stream_polled: Arc::new(Notify::new()),
+            stream_dropped: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn requests(&self) -> Vec<ChatCompletionRequest> {
+        self.requests.lock().await.clone()
+    }
+}
+
+struct NotifyOnDrop {
+    notify: Arc<Notify>,
+}
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.notify.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl UpstreamClient for PendingChunkUpstream {
+    async fn stream_chat_completion(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<UpstreamStream, resp2chat::error::AppError> {
+        self.requests.lock().await.push(request.clone());
+        let stream_polled = Arc::clone(&self.stream_polled);
+        let stream_dropped = Arc::clone(&self.stream_dropped);
+        let stream = async_stream::stream! {
+            let _drop_guard = NotifyOnDrop {
+                notify: stream_dropped,
+            };
+            stream_polled.notify_waiters();
+            std::future::pending::<()>().await;
+            yield Ok(content_chunk("chat-1", "unreachable"));
+        };
+        Ok(Box::pin(stream))
+    }
+
+    async fn list_models(&self) -> Result<reqwest::Response, resp2chat::error::AppError> {
+        Err(resp2chat::error::AppError::internal("unused in this test"))
+    }
+
+    async fn supported_model_ids(&self) -> Result<Vec<String>, resp2chat::error::AppError> {
+        Ok(vec!["glm-5.1".to_string()])
     }
 }
 
@@ -164,6 +245,60 @@ async fn streams_function_call_turn() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].parallel_tool_calls, false);
     assert_eq!(requests[0].tools.as_ref().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn streams_legacy_function_call_turn() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(legacy_function_call_chunk(
+            "chat-1",
+            "echo",
+            "{\"value\":\"hi\"}",
+        ))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut request = base_request(vec![user_message("hello")]);
+    request.tools = vec![ToolSpec::Function {
+        name: "echo".to_string(),
+        description: "Echo back a value".to_string(),
+        strict: false,
+        parameters: json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } },
+            "required": ["value"]
+        }),
+    }];
+
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    assert_eq!(
+        event_names(&events),
+        vec![
+            "response.created",
+            "response.in_progress",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+    );
+    let delta_event = events
+        .iter()
+        .find(|e| e["_event"] == "response.function_call_arguments.delta")
+        .unwrap();
+    let call_id = delta_event["call_id"].as_str().unwrap();
+    assert!(call_id.starts_with("call_"));
+    assert_eq!(delta_event["delta"].as_str(), Some("{\"value\":\"hi\"}"));
+
+    let done_event = events
+        .iter()
+        .find(|e| e["_event"] == "response.output_item.done")
+        .unwrap();
+    assert_eq!(done_event["item"]["type"].as_str(), Some("function_call"));
+    assert_eq!(done_event["item"]["name"].as_str(), Some("echo"));
+    assert_eq!(done_event["item"]["call_id"].as_str(), Some(call_id));
 }
 
 #[tokio::test]
@@ -296,6 +431,134 @@ async fn uses_configured_upstream_model_override() {
 }
 
 #[tokio::test]
+async fn normalizes_model_name_from_upstream_catalog() {
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["Qwen3.5"]).await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut request = base_request(vec![user_message("hello")]);
+    request.model = "some-client-alias".to_string();
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "Qwen3.5");
+}
+
+#[tokio::test]
+async fn single_supported_backend_model_overrides_configured_model_alias() {
+    let upstream = MockUpstream::default();
+    upstream
+        .set_supported_models(["deepseek-r1-distill-qwen-32b"])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let gateway = test_gateway_with_config(
+        upstream.clone(),
+        MockSearch::default(),
+        Config {
+            bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+            upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
+            upstream_api_key: None,
+            upstream_model: Some("alias-from-config".to_string()),
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: std::collections::BTreeMap::new(),
+            brave_base_url: "https://example.com/".parse().expect("url"),
+            brave_api_key: Some("test-key".to_string()),
+            brave_max_results: 5,
+            request_timeout: std::time::Duration::from_secs(30),
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        },
+    );
+
+    let _ = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message("hello")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "deepseek-r1-distill-qwen-32b");
+}
+
+#[tokio::test]
+async fn reuses_cached_upstream_model_catalog_across_requests() {
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["glm-5.1"]).await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "first"))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "second"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut first = base_request(vec![user_message("hello")]);
+    first.model = "GLM-5.1".to_string();
+    let _ = collect_stream(
+        gateway
+            .clone()
+            .stream_responses(first)
+            .await
+            .expect("first stream"),
+    )
+    .await;
+
+    let mut second = base_request(vec![user_message("hello again")]);
+    second.model = "GLM 5 1".to_string();
+    let _ = collect_stream(
+        gateway
+            .stream_responses(second)
+            .await
+            .expect("second stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].model, "glm-5.1");
+    assert_eq!(requests[1].model, "glm-5.1");
+    assert_eq!(upstream.supported_model_queries().await, 1);
+}
+
+#[tokio::test]
+async fn leaves_model_name_unchanged_when_catalog_match_is_ambiguous() {
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["foo-1", "foo1"]).await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut request = base_request(vec![user_message("hello")]);
+    request.model = "FOO 1".to_string();
+
+    let _ = collect_stream(
+        gateway
+            .stream_responses(request.clone())
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, request.model);
+}
+
+#[tokio::test]
 async fn returns_final_usage_on_response_completed() {
     let upstream = MockUpstream::default();
     upstream
@@ -348,6 +611,86 @@ async fn returns_final_usage_on_response_completed() {
             .and_then(|event| event["response"]["usage"]["total_tokens"].as_u64()),
         Some(17)
     );
+}
+
+#[tokio::test]
+async fn responses_stream_events_include_item_identity_and_generated_output_only() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(reasoning_chunk("chat-1", "think")),
+            Ok(content_chunk("chat-1", "hello")),
+        ])
+        .await;
+    let gateway = test_gateway(upstream, MockSearch::default());
+
+    let events = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message("hello")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let reasoning_added = events
+        .iter()
+        .find(|event| {
+            event["_event"] == "response.output_item.added"
+                && event["item"]["type"].as_str() == Some("reasoning")
+        })
+        .expect("reasoning item added");
+    let reasoning_id = reasoning_added["item"]["id"]
+        .as_str()
+        .expect("reasoning item id");
+    assert_eq!(reasoning_added["output_index"], 0);
+
+    let reasoning_delta = events
+        .iter()
+        .find(|event| event["_event"] == "response.reasoning_summary_text.delta")
+        .expect("reasoning delta");
+    assert_eq!(reasoning_delta["item_id"], reasoning_id);
+    assert_eq!(reasoning_delta["output_index"], 0);
+    assert_eq!(reasoning_delta["summary_index"], 0);
+
+    let message_added = events
+        .iter()
+        .find(|event| {
+            event["_event"] == "response.output_item.added"
+                && event["item"]["type"].as_str() == Some("message")
+        })
+        .expect("message item added");
+    let message_id = message_added["item"]["id"]
+        .as_str()
+        .expect("message item id");
+    assert_eq!(message_added["output_index"], 1);
+
+    let text_delta = events
+        .iter()
+        .find(|event| event["_event"] == "response.output_text.delta")
+        .expect("text delta");
+    assert_eq!(text_delta["item_id"], message_id);
+    assert_eq!(text_delta["output_index"], 1);
+    assert_eq!(text_delta["content_index"], 0);
+
+    let content_added = events
+        .iter()
+        .find(|event| event["_event"] == "response.content_part.added")
+        .expect("content part added");
+    assert_eq!(content_added["item_id"], message_id);
+    assert_eq!(content_added["output_index"], 1);
+    assert_eq!(content_added["content_index"], 0);
+
+    let completed = events
+        .iter()
+        .find(|event| event["_event"] == "response.completed")
+        .expect("response.completed");
+    let output = completed["response"]["output"]
+        .as_array()
+        .expect("response output");
+    assert_eq!(output.len(), 2);
+    assert_eq!(output[0]["type"].as_str(), Some("reasoning"));
+    assert_eq!(output[1]["type"].as_str(), Some("message"));
+    assert_eq!(output[1]["role"].as_str(), Some("assistant"));
 }
 
 #[tokio::test]
@@ -1849,7 +2192,9 @@ fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
                 content: Some(content.to_string()),
                 reasoning_content: None,
                 tool_calls: None,
+                function_call: None,
                 refusal: None,
+                extra: Default::default(),
             },
             finish_reason: None,
         }],
@@ -1866,7 +2211,9 @@ fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
                 content: None,
                 reasoning_content: Some(reasoning.to_string()),
                 tool_calls: None,
+                function_call: None,
                 refusal: None,
+                extra: Default::default(),
             },
             finish_reason: None,
         }],
@@ -1891,9 +2238,33 @@ fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> Chat
                         arguments: Some(serde_json::Value::String(arguments.to_string())),
                     },
                 }]),
+                function_call: None,
                 refusal: None,
+                extra: Default::default(),
             },
             finish_reason: Some("tool_calls".to_string()),
+        }],
+        usage: None,
+    }
+}
+
+fn legacy_function_call_chunk(id: &str, name: &str, arguments: &str) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta {
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+                function_call: Some(ChatFunctionCall {
+                    name: Some(name.to_string()),
+                    arguments: Some(serde_json::Value::String(arguments.to_string())),
+                }),
+                refusal: None,
+                extra: Default::default(),
+            },
+            finish_reason: Some("function_call".to_string()),
         }],
         usage: None,
     }
@@ -1962,6 +2333,17 @@ fn done_items(events: &[serde_json::Value]) -> Vec<ResponseItem> {
         .collect()
 }
 
+fn parse_anthropic_sse_events(body: &str) -> Vec<serde_json::Value> {
+    body.split("\n\n")
+        .filter_map(|block| {
+            block.lines().find_map(|line| {
+                line.strip_prefix("data: ")
+                    .map(|data| serde_json::from_str(data).expect("valid Anthropic SSE JSON"))
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic /v1/messages integration tests
 // ---------------------------------------------------------------------------
@@ -1973,6 +2355,7 @@ async fn anthropic_messages_streams_text_response() {
         .push_response(vec![
             Ok(content_chunk("chat-1", "Hello")),
             Ok(content_chunk("chat-1", " there")),
+            Ok(usage_chunk("chat-1", 12, 5, 17, Some(3), None)),
         ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
@@ -2035,6 +2418,13 @@ async fn anthropic_messages_streams_text_response() {
     // Verify the text content was streamed
     assert!(body_text.contains("Hello"), "missing text content");
     assert!(body_text.contains(" there"), "missing second text delta");
+    let anthropic_events = parse_anthropic_sse_events(&body_text);
+    let message_delta = anthropic_events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .expect("message_delta event");
+    assert_eq!(message_delta["usage"]["input_tokens"], 12);
+    assert_eq!(message_delta["usage"]["output_tokens"], 5);
 
     // Verify the upstream received a chat completions request
     let requests = upstream.requests().await;
@@ -2213,6 +2603,68 @@ async fn anthropic_messages_returns_non_streaming_json() {
 }
 
 #[tokio::test]
+async fn responses_returns_non_streaming_json_while_streaming_upstream() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = resp2chat::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Hi" }
+                ]
+            }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid json");
+    assert_eq!(json["object"], "response");
+    assert_eq!(json["status"], "completed");
+    assert!(
+        json["output"]
+            .as_array()
+            .expect("output array")
+            .iter()
+            .any(|item| {
+                item["type"] == "message"
+                    && item["role"] == "assistant"
+                    && item["content"]
+                        .as_array()
+                        .is_some_and(|content| content.iter().any(|part| part["text"] == "Hello"))
+            }),
+        "expected buffered assistant output text in final response: {json}"
+    );
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].stream, true);
+}
+
+#[tokio::test]
 async fn anthropic_messages_converts_tool_result_history() {
     let upstream = MockUpstream::default();
     upstream
@@ -2279,4 +2731,53 @@ async fn anthropic_messages_converts_tool_result_history() {
         tool_msgs[0].content.as_ref().and_then(|v| v.as_str()),
         Some("72°F sunny")
     );
+}
+
+#[tokio::test]
+async fn cancels_mid_stream_when_client_disconnects() {
+    let upstream = PendingChunkUpstream::new();
+    let stream_polled = upstream.stream_polled.notified();
+    let gateway = Arc::new(Gateway::new(
+        Config {
+            bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+            upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: std::collections::BTreeMap::new(),
+            brave_base_url: "https://example.com/".parse().expect("url"),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout: std::time::Duration::from_secs(30),
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        },
+        ReplayStore::new(1000),
+        Arc::new(upstream.clone()),
+        Arc::new(MockSearch::default()),
+        MonitorHub::new(128),
+    ));
+
+    let request = base_request(vec![user_message("count")]);
+    let mut stream = gateway.stream_responses(request).await.expect("stream");
+
+    let _event1 = stream.next().await;
+    let _event2 = stream.next().await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), stream_polled)
+        .await
+        .expect("upstream stream should be waiting for a chunk");
+
+    let stream_dropped = upstream.stream_dropped.notified();
+    drop(stream);
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), stream_dropped)
+        .await
+        .expect("upstream stream should be dropped after client disconnect");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
 }
