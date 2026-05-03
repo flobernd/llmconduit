@@ -23,7 +23,11 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "max_tokens",
+        alias = "max_output_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_output_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
@@ -76,9 +80,13 @@ pub struct ChatToolCall {
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_chat_tool_call_kind")]
     pub kind: String,
     pub function: ChatFunctionCall,
+}
+
+fn default_chat_tool_call_kind() -> String {
+    "function".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,8 +140,53 @@ pub struct ChatDelta {
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
     pub tool_calls: Option<Vec<ChatToolCall>>,
+    pub function_call: Option<ChatFunctionCall>,
     #[serde(default)]
     pub refusal: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl ChatDelta {
+    pub fn reasoning_delta(&self) -> Option<&str> {
+        self.reasoning_content.as_deref().or_else(|| {
+            [
+                "reasoning",
+                "reasoning_text",
+                "reasoning_delta",
+                "thinking",
+                "thinking_content",
+            ]
+            .into_iter()
+            .find_map(|key| self.extra.get(key).and_then(Value::as_str))
+        })
+    }
+
+    pub fn non_null_delta_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        if self.content.is_some() {
+            keys.push("content".to_string());
+        }
+        if self.reasoning_content.is_some() {
+            keys.push("reasoning_content".to_string());
+        }
+        if self.tool_calls.is_some() {
+            keys.push("tool_calls".to_string());
+        }
+        if self.function_call.is_some() {
+            keys.push("function_call".to_string());
+        }
+        if self.refusal.is_some() {
+            keys.push("refusal".to_string());
+        }
+        keys.extend(
+            self.extra
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, _)| key.clone()),
+        );
+        keys
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,4 +207,119 @@ pub struct ChatResponseMessage {
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
     pub tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn deserializes_tool_call_chunk_without_type_field() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {
+                            "name": "echo",
+                            "arguments": "{\"value\":\"hi\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("chunk should deserialize");
+
+        let tool_call = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call.kind, "function");
+        assert_eq!(tool_call.id.as_deref(), Some("call_1"));
+        assert_eq!(tool_call.function.name.as_deref(), Some("echo"));
+    }
+
+    #[test]
+    fn deserializes_legacy_function_call_chunk() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "function_call": {
+                        "name": "echo",
+                        "arguments": "{\"value\":\"hi\"}"
+                    }
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("chunk should deserialize");
+
+        let function_call = chunk.choices[0].delta.function_call.as_ref().unwrap();
+        assert_eq!(function_call.name.as_deref(), Some("echo"));
+        assert_eq!(
+            function_call.arguments.as_ref().and_then(Value::as_str),
+            Some("{\"value\":\"hi\"}")
+        );
+        assert_eq!(
+            chunk.choices[0].delta.non_null_delta_keys(),
+            vec!["function_call".to_string()]
+        );
+    }
+
+    #[test]
+    fn deserializes_reasoning_delta_alias() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning": "hidden step"
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("chunk should deserialize");
+
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_delta(),
+            Some("hidden step")
+        );
+        assert_eq!(
+            chunk.choices[0].delta.non_null_delta_keys(),
+            vec!["reasoning".to_string()]
+        );
+    }
+
+    #[test]
+    fn serializes_max_output_tokens_as_chat_max_tokens() {
+        let request = ChatCompletionRequest {
+            model: "glm-5.1".to_string(),
+            messages: Vec::new(),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: false,
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: Some(256),
+            frequency_penalty: None,
+            presence_penalty: None,
+            extra_body: Default::default(),
+        };
+
+        let value = serde_json::to_value(request).expect("serialize");
+
+        assert_eq!(value["max_tokens"], Value::from(256));
+        assert!(
+            value.get("max_output_tokens").is_none(),
+            "chat backend requests should use max_tokens"
+        );
+    }
 }

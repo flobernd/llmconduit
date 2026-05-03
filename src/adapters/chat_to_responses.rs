@@ -70,11 +70,28 @@ struct ToolCallAccumulator {
     arguments_text: String,
 }
 
+impl ToolCallAccumulator {
+    fn ensure_call_id(&mut self, upstream_id: Option<&str>) -> String {
+        if self.id.is_none() {
+            self.id = Some(
+                upstream_id
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| new_item_id("call")),
+            );
+        }
+        self.id.clone().expect("call id should be initialized")
+    }
+}
+
 impl StreamState {
     pub fn apply_chunk(&mut self, chunk: &ChatCompletionChunk) -> Vec<StreamEmission> {
         let mut emissions = Vec::new();
         for choice in &chunk.choices {
-            if let Some(reasoning_delta) = &choice.delta.reasoning_content {
+            if let Some(reasoning_delta) = choice
+                .delta
+                .reasoning_delta()
+                .filter(|delta| !delta.is_empty())
+            {
                 if self.reasoning_id.is_none() {
                     let item = ResponseItem::Reasoning {
                         id: new_item_id("rsn"),
@@ -91,9 +108,16 @@ impl StreamState {
                     self.reasoning_part_emitted = true;
                 }
                 self.reasoning_text.push_str(reasoning_delta);
-                emissions.push(StreamEmission::ReasoningTextDelta(reasoning_delta.clone()));
+                emissions.push(StreamEmission::ReasoningTextDelta(
+                    reasoning_delta.to_string(),
+                ));
             }
-            if let Some(content_delta) = &choice.delta.content {
+            if let Some(content_delta) = choice
+                .delta
+                .content
+                .as_deref()
+                .filter(|delta| !delta.is_empty())
+            {
                 if self.message_id.is_none() {
                     let item = ResponseItem::Message {
                         id: Some(new_item_id("msg")),
@@ -112,11 +136,16 @@ impl StreamState {
                     self.content_part_emitted = true;
                 }
                 self.output_text.push_str(content_delta);
-                emissions.push(StreamEmission::OutputTextDelta(content_delta.clone()));
+                emissions.push(StreamEmission::OutputTextDelta(content_delta.to_string()));
             }
-            if let Some(refusal) = &choice.delta.refusal {
+            if let Some(refusal) = choice
+                .delta
+                .refusal
+                .as_deref()
+                .filter(|delta| !delta.is_empty())
+            {
                 self.refusal_text.push_str(refusal);
-                emissions.push(StreamEmission::RefusalDelta(refusal.clone()));
+                emissions.push(StreamEmission::RefusalDelta(refusal.to_string()));
             }
             if let Some(reason) = &choice.finish_reason {
                 self.finish_reason = Some(reason.clone());
@@ -124,28 +153,52 @@ impl StreamState {
             if let Some(tool_calls) = &choice.delta.tool_calls {
                 for tool_call in tool_calls {
                     let index = tool_call.index.unwrap_or(0);
-                    let entry = self.tool_calls.entry(index).or_default();
-                    if let Some(id) = &tool_call.id {
-                        entry.id = Some(id.clone());
-                    }
-                    if let Some(name) = &tool_call.function.name {
-                        entry.name = Some(name.clone());
-                    }
-                    if let Some(arguments) = &tool_call.function.arguments {
-                        let before_len = entry.arguments_text.len();
-                        append_argument_fragment(&mut entry.arguments_text, arguments);
-                        if let Some(call_id) = &entry.id {
-                            let delta = entry.arguments_text[before_len..].to_string();
-                            emissions.push(StreamEmission::FunctionCallArgumentsDelta {
-                                call_id: call_id.clone(),
-                                delta,
-                            });
-                        }
-                    }
+                    self.apply_tool_call_delta(
+                        index,
+                        tool_call.id.as_deref(),
+                        tool_call.function.name.as_deref(),
+                        tool_call.function.arguments.as_ref(),
+                        &mut emissions,
+                    );
                 }
+            }
+            if let Some(function_call) = &choice.delta.function_call {
+                self.apply_tool_call_delta(
+                    0,
+                    None,
+                    function_call.name.as_deref(),
+                    function_call.arguments.as_ref(),
+                    &mut emissions,
+                );
             }
         }
         emissions
+    }
+
+    fn apply_tool_call_delta(
+        &mut self,
+        index: usize,
+        upstream_id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&Value>,
+        emissions: &mut Vec<StreamEmission>,
+    ) {
+        let entry = self.tool_calls.entry(index).or_default();
+        if let Some(name) = name {
+            entry.name = Some(name.to_string());
+        }
+        if upstream_id.is_some() && entry.id.is_none() {
+            entry.ensure_call_id(upstream_id);
+        }
+        if let Some(arguments) = arguments {
+            let call_id = entry.ensure_call_id(upstream_id);
+            let before_len = entry.arguments_text.len();
+            append_argument_fragment(&mut entry.arguments_text, arguments);
+            let delta = entry.arguments_text[before_len..].to_string();
+            if !delta.is_empty() {
+                emissions.push(StreamEmission::FunctionCallArgumentsDelta { call_id, delta });
+            }
+        }
     }
 
     pub fn finalize(self, registry: &ToolRegistry) -> AppResult<FinalizedAssistantTurn> {
@@ -366,7 +419,9 @@ mod tests {
                     content: Some(text.to_string()),
                     reasoning_content: None,
                     tool_calls: None,
+                    function_call: None,
                     refusal: None,
+                    extra: Default::default(),
                 },
                 finish_reason: None,
             }],
@@ -383,7 +438,9 @@ mod tests {
                     content: None,
                     reasoning_content: Some(text.to_string()),
                     tool_calls: None,
+                    function_call: None,
                     refusal: None,
+                    extra: Default::default(),
                 },
                 finish_reason: None,
             }],
@@ -414,7 +471,35 @@ mod tests {
                             arguments: arguments.map(|s| serde_json::Value::String(s.to_string())),
                         },
                     }]),
+                    function_call: None,
                     refusal: None,
+                    extra: Default::default(),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    fn legacy_function_call_chunk(
+        id: &str,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: id.to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    function_call: Some(ChatFunctionCall {
+                        name: name.map(str::to_string),
+                        arguments: arguments.map(|s| serde_json::Value::String(s.to_string())),
+                    }),
+                    refusal: None,
+                    extra: Default::default(),
                 },
                 finish_reason: None,
             }],
@@ -439,6 +524,38 @@ mod tests {
         assert!(matches!(&emissions[0], StreamEmission::OutputItemAdded(_)));
         assert!(matches!(&emissions[1], StreamEmission::ContentPartAdded));
         assert!(matches!(&emissions[2], StreamEmission::OutputTextDelta(d) if d == "hello"));
+    }
+
+    #[test]
+    fn empty_content_delta_is_silent() {
+        let mut state = StreamState::default();
+        let emissions = state.apply_chunk(&content_chunk("c1", ""));
+        assert!(emissions.is_empty());
+
+        let emissions = state.apply_chunk(&content_chunk("c1", "hello"));
+        assert_eq!(emissions.len(), 3);
+        assert!(matches!(&emissions[0], StreamEmission::OutputItemAdded(_)));
+        assert!(matches!(&emissions[1], StreamEmission::ContentPartAdded));
+        assert!(matches!(&emissions[2], StreamEmission::OutputTextDelta(d) if d == "hello"));
+    }
+
+    #[test]
+    fn empty_reasoning_delta_is_silent() {
+        let mut state = StreamState::default();
+        let emissions = state.apply_chunk(&reasoning_chunk("c1", ""));
+        assert!(emissions.is_empty());
+
+        let emissions = state.apply_chunk(&reasoning_chunk("c1", "thinking"));
+        assert_eq!(emissions.len(), 3);
+        assert!(matches!(
+            &emissions[0],
+            StreamEmission::ReasoningItemAdded(_)
+        ));
+        assert!(matches!(
+            &emissions[1],
+            StreamEmission::ReasoningSummaryPartAdded
+        ));
+        assert!(matches!(&emissions[2], StreamEmission::ReasoningTextDelta(d) if d == "thinking"));
     }
 
     #[test]
@@ -527,13 +644,14 @@ mod tests {
     #[test]
     fn finalize_empty_arguments() {
         let mut state = StreamState::default();
-        state.apply_chunk(&tool_call_chunk(
+        let emissions = state.apply_chunk(&tool_call_chunk(
             "c1",
             Some("call_1"),
             0,
             Some("echo"),
             Some(""),
         ));
+        assert!(emissions.is_empty());
         let registry = simple_registry(vec![(
             "echo",
             ToolKind::Function {
@@ -654,6 +772,102 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_arguments_before_id_are_emitted() {
+        let mut state = StreamState::default();
+        let emissions = state.apply_chunk(&tool_call_chunk(
+            "c1",
+            None,
+            0,
+            Some("echo"),
+            Some(r#"{"value":"hi"}"#),
+        ));
+        let deltas: Vec<_> = emissions
+            .iter()
+            .filter_map(|e| match e {
+                StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                    Some((call_id.clone(), delta.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert!(deltas[0].0.starts_with("call_"));
+        assert_eq!(deltas[0].1, r#"{"value":"hi"}"#);
+
+        let registry = simple_registry(vec![(
+            "echo",
+            ToolKind::Function {
+                public_name: "echo".to_string(),
+                namespace: None,
+            },
+        )]);
+        let finalized = state.finalize(&registry).unwrap();
+        assert!(matches!(
+            &finalized.tool_calls[0].public_item,
+            ResponseItem::FunctionCall { call_id, .. } if call_id == &deltas[0].0
+        ));
+        assert_eq!(
+            finalized.tool_calls[0].arguments,
+            serde_json::json!({"value": "hi"})
+        );
+    }
+
+    #[test]
+    fn legacy_function_call_arguments_are_emitted() {
+        let mut state = StreamState::default();
+        state.apply_chunk(&legacy_function_call_chunk("c1", Some("echo"), None));
+        let emissions =
+            state.apply_chunk(&legacy_function_call_chunk("c1", None, Some(r#"{"val"#)));
+        let deltas: Vec<_> = emissions
+            .iter()
+            .filter_map(|e| match e {
+                StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                    Some((call_id.clone(), delta.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert!(deltas[0].0.starts_with("call_"));
+        assert_eq!(deltas[0].1, r#"{"val"#);
+
+        let emissions2 = state.apply_chunk(&legacy_function_call_chunk(
+            "c1",
+            None,
+            Some(r#"ue":"hi"}"#),
+        ));
+        let deltas2: Vec<_> = emissions2
+            .iter()
+            .filter_map(|e| match e {
+                StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                    Some((call_id.clone(), delta.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas2.len(), 1);
+        assert_eq!(deltas2[0].0, deltas[0].0);
+        assert_eq!(deltas2[0].1, r#"ue":"hi"}"#);
+
+        let registry = simple_registry(vec![(
+            "echo",
+            ToolKind::Function {
+                public_name: "echo".to_string(),
+                namespace: None,
+            },
+        )]);
+        let finalized = state.finalize(&registry).unwrap();
+        assert!(matches!(
+            &finalized.tool_calls[0].public_item,
+            ResponseItem::FunctionCall { call_id, .. } if call_id == &deltas[0].0
+        ));
+        assert_eq!(
+            finalized.tool_calls[0].arguments,
+            serde_json::json!({"value": "hi"})
+        );
+    }
+
+    #[test]
     fn append_argument_fragment_non_string() {
         let mut buffer = String::new();
         append_argument_fragment(&mut buffer, &serde_json::json!(42));
@@ -704,6 +918,38 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_delta_alias_emitted() {
+        let mut state = StreamState::default();
+        let chunk = ChatCompletionChunk {
+            id: "c1".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    function_call: None,
+                    refusal: None,
+                    extra: std::collections::BTreeMap::from([(
+                        "reasoning".to_string(),
+                        serde_json::json!("hidden step"),
+                    )]),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+
+        let emissions = state.apply_chunk(&chunk);
+
+        assert!(
+            emissions
+                .iter()
+                .any(|emission| matches!(emission, StreamEmission::ReasoningTextDelta(delta) if delta == "hidden step"))
+        );
+    }
+
+    #[test]
     fn test_refusal_delta_emitted() {
         let mut state = StreamState::default();
         let chunk = ChatCompletionChunk {
@@ -714,7 +960,9 @@ mod tests {
                     content: None,
                     reasoning_content: None,
                     tool_calls: None,
+                    function_call: None,
                     refusal: Some("I cannot help".to_string()),
+                    extra: Default::default(),
                 },
                 finish_reason: None,
             }],
@@ -737,7 +985,9 @@ mod tests {
                     content: Some("hi".to_string()),
                     reasoning_content: None,
                     tool_calls: None,
+                    function_call: None,
                     refusal: None,
+                    extra: Default::default(),
                 },
                 finish_reason: Some("length".to_string()),
             }],
