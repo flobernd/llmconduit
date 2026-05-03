@@ -390,18 +390,24 @@ pub struct ResponseOutputTokensDetails {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputItemPayload {
+    pub output_index: usize,
     pub item: ResponseItem,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DeltaPayload {
+    pub item_id: String,
+    pub output_index: usize,
+    pub content_index: usize,
     pub delta: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReasoningDeltaPayload {
+    pub item_id: String,
+    pub output_index: usize,
+    pub summary_index: usize,
     pub delta: String,
-    pub content_index: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -422,8 +428,10 @@ pub struct FailedError {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TextDonePayload {
+    pub item_id: String,
+    pub output_index: usize,
+    pub content_index: usize,
     pub text: String,
-    pub content_index: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,6 +459,8 @@ pub struct RefusalDonePayload {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContentPartPayload {
+    pub item_id: String,
+    pub output_index: usize,
     pub content_index: usize,
     pub part: ContentPartRef,
 }
@@ -460,11 +470,14 @@ pub struct ContentPartRef {
     #[serde(rename = "type")]
     pub kind: String,
     pub text: String,
+    pub annotations: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReasoningSummaryPartPayload {
-    pub content_index: usize,
+    pub item_id: String,
+    pub output_index: usize,
+    pub summary_index: usize,
     pub part: ReasoningSummaryPartRef,
 }
 

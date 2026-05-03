@@ -20,6 +20,7 @@ use axum::response::Sse;
 use axum::routing::get;
 use axum::routing::post;
 use futures::StreamExt;
+use serde_json::Value;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -37,26 +38,13 @@ async fn post_responses(
     State(gateway): State<Arc<Gateway>>,
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
+    let wants_stream = request.stream;
     let stream = gateway.stream_responses(request).await?;
-    let mapped = stream.map(|event| {
-        Ok::<_, Infallible>(
-            axum::response::sse::Event::default()
-                .event(event.event)
-                .data(event.data.to_string()),
-        )
-    });
-    let mut response = Sse::new(mapped)
-        .keep_alive(axum::response::sse::KeepAlive::new())
-        .into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-transform"),
-    );
-    response.headers_mut().insert(
-        HeaderName::from_static("x-accel-buffering"),
-        HeaderValue::from_static("no"),
-    );
-    Ok(response)
+    if wants_stream {
+        Ok(stream_responses_response(stream))
+    } else {
+        collect_responses_response(stream).await
+    }
 }
 
 async fn post_messages(
@@ -93,11 +81,11 @@ fn stream_anthropic_response(
     tokio::spawn(async move {
         let mut converter = AnthropicStreamConverter::new(model);
         let mut stream = std::pin::pin!(stream);
-        while let Some(event) = stream.next().await {
+        'streaming: while let Some(event) = stream.next().await {
             let anthropic_events = converter.convert(&event);
             for anthropic_event in anthropic_events {
                 if tx.send(anthropic_event).await.is_err() {
-                    break;
+                    break 'streaming;
                 }
             }
         }
@@ -123,6 +111,60 @@ fn stream_anthropic_response(
         HeaderValue::from_static("no"),
     );
     Ok(response)
+}
+
+fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) -> Response {
+    let mapped = stream.map(|event| {
+        Ok::<_, Infallible>(
+            axum::response::sse::Event::default()
+                .event(event.event)
+                .data(event.data.to_string()),
+        )
+    });
+    let mut response = Sse::new(mapped)
+        .keep_alive(axum::response::sse::KeepAlive::new())
+        .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
+}
+
+async fn collect_responses_response(
+    stream: ReceiverStream<crate::engine::SseEvent>,
+) -> AppResult<Response> {
+    let mut final_payload: Option<Value> = None;
+    let mut stream = std::pin::pin!(stream);
+    while let Some(event) = stream.next().await {
+        match event.event.as_str() {
+            "response.completed" | "response.incomplete" => {
+                final_payload = event.data.get("response").cloned();
+            }
+            "response.failed" => {
+                let message = event
+                    .data
+                    .get("response")
+                    .and_then(|response| response.get("error"))
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream request failed");
+                return Err(AppError::upstream(message));
+            }
+            _ => {}
+        }
+    }
+
+    match final_payload {
+        Some(payload) => Ok(Json(payload).into_response()),
+        None => Err(AppError::upstream(
+            "stream ended before a final response resource was emitted",
+        )),
+    }
 }
 
 async fn collect_anthropic_response(

@@ -340,9 +340,6 @@ fn hoist_system_messages(messages: &mut Vec<ChatMessage>) {
 }
 
 fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
-    if !request.stream {
-        return Err(AppError::bad_request("only stream=true is supported"));
-    }
     if request.previous_response_id.is_some() {
         return Err(AppError::bad_request(
             "previous_response_id is not supported in v1",
@@ -823,10 +820,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_stream_false() {
+    fn validate_accepts_stream_false() {
         let mut req = base_test_request();
         req.stream = false;
-        assert!(validate_request(&req).is_err());
+        assert!(validate_request(&req).is_ok());
     }
 
     #[test]
