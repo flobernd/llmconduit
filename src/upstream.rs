@@ -322,7 +322,7 @@ fn sanitize_message_content(content: Value, flatten_content: bool) -> Option<Val
         Value::Null => None,
         Value::String(text) => Some(Value::String(text)),
         Value::Array(parts) => {
-            if flatten_content {
+            if flatten_content && parts.iter().all(is_text_content_part) {
                 Some(Value::String(flatten_content_parts(&parts)))
             } else {
                 Some(Value::Array(parts))
@@ -330,6 +330,10 @@ fn sanitize_message_content(content: Value, flatten_content: bool) -> Option<Val
         }
         other => Some(stringify_json_value(other)),
     }
+}
+
+fn is_text_content_part(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("text")
 }
 
 fn flatten_content_parts(parts: &[Value]) -> String {
@@ -611,6 +615,45 @@ mod tests {
         let result = super::flatten_content_parts(&parts);
         assert!(result.contains("image"));
         assert!(result.contains("data"));
+    }
+
+    #[test]
+    fn sanitize_message_content_text_flattened_when_flag_true() {
+        let parts = serde_json::json!([
+            {"type": "text", "text": "hello"},
+            {"type": "text", "text": "world"}
+        ]);
+        let result = super::sanitize_message_content(parts, true);
+        assert_eq!(result, Some(serde_json::Value::String("hello\nworld".to_string())));
+    }
+
+    #[test]
+    fn sanitize_message_content_image_preserved_when_flag_true() {
+        let parts = serde_json::json!([
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/abc"}}
+        ]);
+        let result = super::sanitize_message_content(parts.clone(), true);
+        assert_eq!(result, Some(parts));
+    }
+
+    #[test]
+    fn sanitize_message_content_mixed_preserved_when_flag_true() {
+        let parts = serde_json::json!([
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        ]);
+        let result = super::sanitize_message_content(parts.clone(), true);
+        assert_eq!(result, Some(parts));
+    }
+
+    #[test]
+    fn sanitize_message_content_array_preserved_when_flag_false() {
+        let parts = serde_json::json!([
+            {"type": "text", "text": "hello"}
+        ]);
+        let result = super::sanitize_message_content(parts.clone(), false);
+        assert_eq!(result, Some(parts));
     }
 
     #[test]
