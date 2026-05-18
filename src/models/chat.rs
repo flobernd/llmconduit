@@ -85,13 +85,25 @@ pub struct ChatToolCall {
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
-    #[serde(rename = "type", default = "default_chat_tool_call_kind")]
+    #[serde(
+        rename = "type",
+        default = "default_chat_tool_call_kind",
+        deserialize_with = "deserialize_chat_tool_call_kind"
+    )]
     pub kind: String,
     pub function: ChatFunctionCall,
 }
 
 fn default_chat_tool_call_kind() -> String {
     "function".to_string()
+}
+
+fn deserialize_chat_tool_call_kind<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .unwrap_or_else(default_chat_tool_call_kind))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -246,6 +258,22 @@ mod tests {
         assert_eq!(tool_call.kind, "function");
         assert_eq!(tool_call.id.as_deref(), Some("call_1"));
         assert_eq!(tool_call.function.name.as_deref(), Some("echo"));
+    }
+
+    #[test]
+    fn deserializes_tool_call_chunk_with_null_type_field() {
+        let payload = r#"{"id":"chatcmpl-872acb605d617b3c","object":"chat.completion.chunk","created":1778678877,"model":"Kimi-K2.6","choices":[{"index":0,"delta":{"tool_calls":[{"id":null,"type":null,"index":0,"function":{"name":null,"arguments":"\"} "}}]},"logprobs":null,"finish_reason":"tool_calls","stop_reason":163586,"token_ids":null}]}"#;
+        let chunk: ChatCompletionChunk =
+            serde_json::from_str(payload).expect("chunk with null type should deserialize");
+
+        let tool_call = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call.kind, "function");
+        assert!(tool_call.id.is_none());
+        assert!(tool_call.function.name.is_none());
+        assert_eq!(
+            tool_call.function.arguments.as_ref().and_then(Value::as_str),
+            Some("\"} ")
+        );
     }
 
     #[test]
