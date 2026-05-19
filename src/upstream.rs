@@ -428,6 +428,7 @@ mod tests {
             max_output_tokens: None,
             frequency_penalty: None,
             presence_penalty: None,
+            stop: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -461,6 +462,7 @@ mod tests {
             max_output_tokens: None,
             frequency_penalty: None,
             presence_penalty: None,
+            stop: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -492,6 +494,7 @@ mod tests {
             max_output_tokens: None,
             frequency_penalty: None,
             presence_penalty: None,
+            stop: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -532,6 +535,7 @@ mod tests {
             max_output_tokens: None,
             frequency_penalty: None,
             presence_penalty: None,
+            stop: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -574,6 +578,7 @@ mod tests {
             max_output_tokens: None,
             frequency_penalty: None,
             presence_penalty: None,
+            stop: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -659,6 +664,7 @@ mod tests {
                 max_output_tokens: None,
                 frequency_penalty: None,
                 presence_penalty: None,
+                stop: None,
                 extra_body: BTreeMap::new(),
             },
             true,

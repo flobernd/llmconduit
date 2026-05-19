@@ -621,6 +621,7 @@ impl Gateway {
             &response_format,
             &reasoning_effort,
         );
+        let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
         loop {
             if tx.is_closed() {
                 return Err(AppError::cancelled());
@@ -644,6 +645,7 @@ impl Gateway {
                 max_output_tokens: request.max_output_tokens,
                 frequency_penalty: request.frequency_penalty,
                 presence_penalty: request.presence_penalty,
+                stop: normalized_stop.clone(),
                 extra_body: upstream_extra_body.clone(),
             };
             self.monitor.emit(
