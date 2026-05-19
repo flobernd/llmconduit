@@ -2436,6 +2436,18 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
     assert_eq!(tool_msgs.len(), 3);
 }
 
+#[tokio::test]
+async fn gateway_tokenize_capability_defaults_unknown_and_updates() {
+    use resp2chat::engine::TokenizeCapability;
+    let gateway = test_gateway(MockUpstream::default(), MockSearch::default());
+
+    assert_eq!(gateway.tokenize_capability(), TokenizeCapability::Unknown);
+    gateway.set_tokenize_capability(TokenizeCapability::Unsupported);
+    assert_eq!(gateway.tokenize_capability(), TokenizeCapability::Unsupported);
+    gateway.set_tokenize_capability(TokenizeCapability::Supported);
+    assert_eq!(gateway.tokenize_capability(), TokenizeCapability::Supported);
+}
+
 fn test_gateway(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
     test_gateway_with_config(upstream, search, test_config())
 }
@@ -3594,4 +3606,163 @@ async fn cancels_mid_stream_when_client_disconnects() {
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn count_tokens_returns_input_tokens_from_upstream() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 77 })))
+        .mount(&server)
+        .await;
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: None,
+        upstream_request_log_path: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        model_profiles: std::collections::BTreeMap::new(),
+        brave_base_url: "https://example.com/".parse().expect("url"),
+        brave_api_key: None,
+        brave_max_results: 5,
+        request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
+        max_web_search_rounds: 5,
+        flatten_content: true,
+        max_replay_entries: 1000,
+    };
+    let app = resp2chat::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-x",
+                        "messages": [{ "role": "user", "content": "hello" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(body, json!({ "input_tokens": 77 }));
+}
+
+#[tokio::test]
+async fn count_tokens_returns_404_when_upstream_tokenize_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    let app = resp2chat::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "model": "claude-x", "messages": [{ "role": "user", "content": "hi" }] })
+                        .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 404);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "not_found_error");
+}
+
+#[tokio::test]
+async fn count_tokens_negative_cache_skips_second_upstream_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    // Same app instance across both calls => shared Arc<Gateway> => shared cache.
+    let app = resp2chat::build_app(config);
+
+    let make = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages/count_tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "model": "claude-x", "messages": [{ "role": "user", "content": "hi" }] })
+                    .to_string(),
+            ))
+            .expect("request")
+    };
+
+    let r1 = app.clone().oneshot(make()).await.expect("response 1");
+    assert_eq!(r1.status().as_u16(), 404);
+    let r1_bytes = axum::body::to_bytes(r1.into_body(), 1024 * 1024)
+        .await
+        .expect("read body 1");
+    let r1_body: serde_json::Value = serde_json::from_slice(&r1_bytes).expect("json 1");
+    assert_eq!(r1_body["error"]["type"], "not_found_error");
+
+    let r2 = app.clone().oneshot(make()).await.expect("response 2");
+    assert_eq!(r2.status().as_u16(), 404);
+
+    let received = server.received_requests().await.expect("requests");
+    let tokenize_hits = received
+        .iter()
+        .filter(|req| req.url.path() == "/tokenize")
+        .count();
+    assert_eq!(tokenize_hits, 1, "second call must be served from negative cache");
+}
+
+#[tokio::test]
+async fn count_tokens_malformed_body_returns_400() {
+    let mut config = test_config();
+    config.upstream_base_url = "http://127.0.0.1:8000/v1".parse().expect("url");
+    let app = resp2chat::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(Body::from("{ not json"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 400);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
 }

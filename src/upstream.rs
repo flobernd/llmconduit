@@ -39,6 +39,9 @@ pub trait UpstreamClient: Send + Sync {
             "upstream completions proxy is not implemented",
         ))
     }
+    async fn count_tokens(&self, _body: &serde_json::Value) -> AppResult<Option<u64>> {
+        Ok(None)
+    }
     async fn supported_model_ids(&self) -> AppResult<Vec<String>>;
 }
 
@@ -80,6 +83,27 @@ impl UpstreamRequestLogger {
         .await
         .map_err(|err| std::io::Error::other(format!("spawn_blocking failed: {err}")))?
     }
+}
+
+/// vLLM/sglang serve `/tokenize` at the server root, not under `/v1`.
+/// Strip a single trailing `v1` path segment and append `tokenize`.
+fn derive_tokenize_url(base: &Url) -> Url {
+    let mut segments: Vec<String> = base
+        .path_segments()
+        .map(|parts| {
+            parts
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if segments.last().map(String::as_str) == Some("v1") {
+        segments.pop();
+    }
+    segments.push("tokenize".to_string());
+    let mut url = base.clone();
+    url.set_path(&format!("/{}", segments.join("/")));
+    url
 }
 
 impl ReqwestUpstreamClient {
@@ -170,6 +194,29 @@ impl UpstreamClient for ReqwestUpstreamClient {
         self.with_auth(request).send().await.map_err(|err| {
             AppError::upstream(format!("upstream completions request failed: {err}"))
         })
+    }
+
+    async fn count_tokens(&self, body: &serde_json::Value) -> AppResult<Option<u64>> {
+        let url = derive_tokenize_url(&self.base_url);
+        let response = match self.with_auth(self.client.post(url)).json(body).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::debug!(error = %err, "upstream /tokenize request failed");
+                return Ok(None);
+            }
+        };
+        if !response.status().is_success() {
+            tracing::debug!(status = %response.status(), "upstream /tokenize non-2xx");
+            return Ok(None);
+        }
+        let value: serde_json::Value = match response.json().await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::debug!(error = %err, "upstream /tokenize body not json");
+                return Ok(None);
+            }
+        };
+        Ok(value.get("count").and_then(serde_json::Value::as_u64))
     }
 
     async fn supported_model_ids(&self) -> AppResult<Vec<String>> {
@@ -361,6 +408,7 @@ fn stringify_json_value(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::ReqwestUpstreamClient;
+    use super::UpstreamClient;
     use super::UpstreamRequestLogger;
     use super::extract_supported_model_ids;
     use super::sanitize_chat_request;
@@ -763,5 +811,69 @@ mod tests {
     fn extract_supported_model_ids_returns_empty_for_unexpected_payload() {
         let body = serde_json::json!({"models": ["glm-5.1"]});
         assert!(extract_supported_model_ids(&body).is_empty());
+    }
+
+    #[test]
+    fn derive_tokenize_url_strips_trailing_v1() {
+        let cases = [
+            ("http://host:8000/v1", "http://host:8000/tokenize"),
+            ("http://host:8000/v1/", "http://host:8000/tokenize"),
+            ("http://host:8000", "http://host:8000/tokenize"),
+            ("http://host:8000/", "http://host:8000/tokenize"),
+            ("http://host:8000/openai/v1", "http://host:8000/openai/tokenize"),
+        ];
+        for (base, expected) in cases {
+            let url = super::derive_tokenize_url(&base.parse().expect("base url"));
+            assert_eq!(url.as_str(), expected, "base {base}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reqwest_count_tokens_reads_count_from_root_tokenize() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/tokenize"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "count": 123, "max_model_len": 8192 })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            format!("{}/v1", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+        );
+
+        let body = serde_json::json!({ "model": "m", "messages": [] });
+        let count = client.count_tokens(&body).await.expect("ok");
+        assert_eq!(count, Some(123));
+    }
+
+    #[tokio::test]
+    async fn reqwest_count_tokens_returns_none_on_non_2xx() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/tokenize"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            format!("{}/v1", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+        );
+
+        let count = client
+            .count_tokens(&serde_json::json!({ "model": "m", "messages": [] }))
+            .await
+            .expect("ok");
+        assert_eq!(count, None);
     }
 }
