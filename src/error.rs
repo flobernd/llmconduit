@@ -33,6 +33,15 @@ impl AppError {
         }
     }
 
+    pub fn not_found(message: impl Into<String>) -> Self {
+        let msg = message.into();
+        Self {
+            status: StatusCode::NOT_FOUND,
+            client_message: msg.clone(),
+            message: msg,
+        }
+    }
+
     pub fn upstream(message: impl Into<String>) -> Self {
         let msg = message.into();
         Self {
@@ -127,5 +136,11 @@ mod tests {
     async fn test_upstream_error_shows_detail() {
         let body = response_body_string(AppError::upstream("provider returned 500: oops")).await;
         assert!(body.contains("provider returned 500: oops"));
+    }
+
+    #[test]
+    fn not_found_has_404_status() {
+        let err = AppError::not_found("nope");
+        assert_eq!(err.status_code(), StatusCode::NOT_FOUND);
     }
 }
