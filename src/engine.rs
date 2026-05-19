@@ -55,7 +55,13 @@ use uuid::Uuid;
 
 const UPSTREAM_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizeCapability {
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
 pub struct Gateway {
     config: Config,
     replay_store: ReplayStore,
@@ -64,6 +70,7 @@ pub struct Gateway {
     monitor: MonitorHub,
     raw_output: Option<RawOutput>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
+    tokenize_capability: std::sync::Mutex<TokenizeCapability>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +240,7 @@ impl Gateway {
             monitor,
             raw_output,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
+            tokenize_capability: std::sync::Mutex::new(TokenizeCapability::Unknown),
         }
     }
 
@@ -242,6 +250,20 @@ impl Gateway {
 
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {
         Arc::clone(&self.upstream)
+    }
+
+    pub fn tokenize_capability(&self) -> TokenizeCapability {
+        *self
+            .tokenize_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn set_tokenize_capability(&self, capability: TokenizeCapability) {
+        *self
+            .tokenize_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = capability;
     }
 
     pub async fn resolve_request_model(&self, request_model: &str) -> String {
