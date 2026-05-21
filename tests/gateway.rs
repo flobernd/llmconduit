@@ -3,30 +3,30 @@ use axum::body::Body;
 use axum::http::Request;
 use futures::StreamExt;
 use futures::stream;
+use llmconduit::config::Config;
+use llmconduit::engine::Gateway;
+use llmconduit::models::chat::ChatChunkChoice;
+use llmconduit::models::chat::ChatCompletionChunk;
+use llmconduit::models::chat::ChatCompletionRequest;
+use llmconduit::models::chat::ChatDelta;
+use llmconduit::models::chat::ChatFunctionCall;
+use llmconduit::models::chat::ChatToolCall;
+use llmconduit::models::chat::ChunkUsage;
+use llmconduit::models::chat::CompletionTokensDetails;
+use llmconduit::models::chat::PromptTokensDetails;
+use llmconduit::models::responses::ContentItem;
+use llmconduit::models::responses::NamespaceToolSpec;
+use llmconduit::models::responses::ReasoningSummaryItem;
+use llmconduit::models::responses::ResponseItem;
+use llmconduit::models::responses::ResponsesRequest;
+use llmconduit::models::responses::ToolSpec;
+use llmconduit::monitor::MonitorHub;
+use llmconduit::raw::RawOutput;
+use llmconduit::replay::ReplayStore;
+use llmconduit::search::SearchClient;
+use llmconduit::upstream::UpstreamClient;
+use llmconduit::upstream::UpstreamStream;
 use pretty_assertions::assert_eq;
-use resp2chat::config::Config;
-use resp2chat::engine::Gateway;
-use resp2chat::models::chat::ChatChunkChoice;
-use resp2chat::models::chat::ChatCompletionChunk;
-use resp2chat::models::chat::ChatCompletionRequest;
-use resp2chat::models::chat::ChatDelta;
-use resp2chat::models::chat::ChatFunctionCall;
-use resp2chat::models::chat::ChatToolCall;
-use resp2chat::models::chat::ChunkUsage;
-use resp2chat::models::chat::CompletionTokensDetails;
-use resp2chat::models::chat::PromptTokensDetails;
-use resp2chat::models::responses::ContentItem;
-use resp2chat::models::responses::NamespaceToolSpec;
-use resp2chat::models::responses::ReasoningSummaryItem;
-use resp2chat::models::responses::ResponseItem;
-use resp2chat::models::responses::ResponsesRequest;
-use resp2chat::models::responses::ToolSpec;
-use resp2chat::monitor::MonitorHub;
-use resp2chat::raw::RawOutput;
-use resp2chat::replay::ReplayStore;
-use resp2chat::search::SearchClient;
-use resp2chat::upstream::UpstreamClient;
-use resp2chat::upstream::UpstreamStream;
 use serde_json::Map as JsonMap;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -48,7 +48,7 @@ use wiremock::matchers::path;
 #[derive(Clone, Default)]
 struct MockUpstream {
     requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
-    responses: Arc<Mutex<VecDeque<Vec<Result<ChatCompletionChunk, resp2chat::error::AppError>>>>>,
+    responses: Arc<Mutex<VecDeque<Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>>>>,
     supported_models: Arc<Mutex<Vec<String>>>,
     supported_model_queries: Arc<Mutex<usize>>,
 }
@@ -56,7 +56,7 @@ struct MockUpstream {
 impl MockUpstream {
     async fn push_response(
         &self,
-        chunks: Vec<Result<ChatCompletionChunk, resp2chat::error::AppError>>,
+        chunks: Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>,
     ) {
         self.responses.lock().await.push_back(chunks);
     }
@@ -83,7 +83,7 @@ impl UpstreamClient for MockUpstream {
     async fn stream_chat_completion(
         &self,
         request: &ChatCompletionRequest,
-    ) -> Result<UpstreamStream, resp2chat::error::AppError> {
+    ) -> Result<UpstreamStream, llmconduit::error::AppError> {
         self.requests.lock().await.push(request.clone());
         let chunks = self
             .responses
@@ -94,11 +94,11 @@ impl UpstreamClient for MockUpstream {
         Ok(Box::pin(stream::iter(chunks)))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, resp2chat::error::AppError> {
-        Err(resp2chat::error::AppError::internal("unused in this test"))
+    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+        Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
-    async fn supported_model_ids(&self) -> Result<Vec<String>, resp2chat::error::AppError> {
+    async fn supported_model_ids(&self) -> Result<Vec<String>, llmconduit::error::AppError> {
         let mut query_count = self.supported_model_queries.lock().await;
         *query_count += 1;
         Ok(self.supported_models.lock().await.clone())
@@ -141,7 +141,7 @@ impl UpstreamClient for PendingChunkUpstream {
     async fn stream_chat_completion(
         &self,
         request: &ChatCompletionRequest,
-    ) -> Result<UpstreamStream, resp2chat::error::AppError> {
+    ) -> Result<UpstreamStream, llmconduit::error::AppError> {
         self.requests.lock().await.push(request.clone());
         let stream_polled = Arc::clone(&self.stream_polled);
         let stream_dropped = Arc::clone(&self.stream_dropped);
@@ -156,11 +156,11 @@ impl UpstreamClient for PendingChunkUpstream {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, resp2chat::error::AppError> {
-        Err(resp2chat::error::AppError::internal("unused in this test"))
+    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+        Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
-    async fn supported_model_ids(&self) -> Result<Vec<String>, resp2chat::error::AppError> {
+    async fn supported_model_ids(&self) -> Result<Vec<String>, llmconduit::error::AppError> {
         Ok(vec!["glm-5.1".to_string()])
     }
 }
@@ -172,7 +172,7 @@ struct MockSearch {
 
 #[async_trait]
 impl SearchClient for MockSearch {
-    async fn search(&self, query: &str) -> Result<String, resp2chat::error::AppError> {
+    async fn search(&self, query: &str) -> Result<String, llmconduit::error::AppError> {
         self.queries.lock().await.push(query.to_string());
         Ok(format!("Search result for {query}"))
     }
@@ -880,8 +880,9 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             upstream_chat_kwargs: JsonMap::new(),
             model_profiles: std::collections::BTreeMap::from([(
                 "Kimi-K2.6".to_string(),
-                resp2chat::config::ModelProfile {
+                llmconduit::config::ModelProfile {
                     upstream_model: None,
+                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
                         json!({
@@ -917,6 +918,44 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             "preserve_thinking": true
         }))
     );
+}
+
+#[tokio::test]
+async fn prepends_profile_system_prompt_prefix_for_responses_requests() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_model: None,
+            system_prompt_prefix: Some("Profile prefix.".to_string()),
+            upstream_chat_kwargs: JsonMap::new(),
+        },
+    )]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let _ = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message("hello")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].messages[0].role, "system");
+    assert_eq!(
+        requests[0].messages[0]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("Profile prefix.")
+    );
+    assert_eq!(requests[0].messages[1].role, "user");
 }
 
 #[tokio::test]
@@ -1089,7 +1128,7 @@ async fn degrades_gracefully_when_web_search_replay_baseline_is_missing() {
         ResponseItem::WebSearchCall {
             id: Some("ws_old_1".to_string()),
             status: Some("completed".to_string()),
-            action: Some(resp2chat::models::responses::WebSearchAction::Search {
+            action: Some(llmconduit::models::responses::WebSearchAction::Search {
                 query: Some("weather seattle".to_string()),
                 queries: None,
             }),
@@ -1142,6 +1181,50 @@ async fn degrades_gracefully_when_web_search_replay_baseline_is_missing() {
 }
 
 #[tokio::test]
+async fn debug_ui_is_disabled_by_default() {
+    let app = llmconduit::build_app(test_config());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/debug")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn serves_embedded_debug_web_ui_when_enabled() {
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/debug")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body = String::from_utf8(body_bytes.to_vec()).expect("utf8 body");
+    assert!(body.contains("/debug/ws"));
+    assert!(body.contains("llmconduit debug"));
+    assert!(body.contains("new WebSocket"));
+}
+
+#[tokio::test]
 async fn proxies_models_endpoint_with_etag() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -1173,7 +1256,7 @@ async fn proxies_models_endpoint_with_etag() {
         flatten_content: true,
         max_replay_entries: 1000,
     };
-    let app = resp2chat::build_app(config);
+    let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
             Request::builder()
@@ -1233,7 +1316,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         flatten_content: true,
         max_replay_entries: 1000,
     };
-    let app = resp2chat::build_app(config);
+    let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
             Request::builder()
@@ -1299,7 +1382,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         flatten_content: true,
         max_replay_entries: 1000,
     };
-    let app = resp2chat::build_app(config);
+    let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
             Request::builder()
@@ -1363,7 +1446,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         flatten_content: true,
         max_replay_entries: 1000,
     };
-    let app = resp2chat::build_app(config);
+    let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
             Request::builder()
@@ -1437,7 +1520,7 @@ async fn proxies_completions_endpoint_passthrough() {
         flatten_content: true,
         max_replay_entries: 1000,
     };
-    let app = resp2chat::build_app(config);
+    let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
             Request::builder()
@@ -1896,7 +1979,7 @@ async fn custom_tool_call_with_developer_message() {
     request.tools = vec![ToolSpec::Custom {
         name: "run_script".to_string(),
         description: "Run a Python script".to_string(),
-        format: resp2chat::models::responses::CustomToolFormat {
+        format: llmconduit::models::responses::CustomToolFormat {
             kind: "text".to_string(),
             syntax: "python".to_string(),
             definition: "Python code to execute".to_string(),
@@ -1942,8 +2025,8 @@ async fn local_shell_call_in_history_with_developer_message() {
             id: Some("ls_1".to_string()),
             call_id: Some("call_ls1".to_string()),
             status: "completed".to_string(),
-            action: resp2chat::models::responses::LocalShellAction::Exec(
-                resp2chat::models::responses::LocalShellExecAction {
+            action: llmconduit::models::responses::LocalShellAction::Exec(
+                llmconduit::models::responses::LocalShellExecAction {
                     command: vec!["ls".to_string(), "-la".to_string()],
                     timeout_ms: None,
                     working_directory: None,
@@ -2121,7 +2204,7 @@ async fn tool_call_triggers_new_function_call_response_item() {
 
 #[tokio::test]
 async fn response_completed_includes_usage_from_upstream() {
-    use resp2chat::models::chat::ChunkUsage;
+    use llmconduit::models::chat::ChunkUsage;
 
     let upstream = MockUpstream::default();
     upstream
@@ -2157,7 +2240,7 @@ async fn response_completed_includes_usage_from_upstream() {
 
 #[tokio::test]
 async fn response_completed_accumulates_usage_across_web_search_rounds() {
-    use resp2chat::models::chat::ChunkUsage;
+    use llmconduit::models::chat::ChunkUsage;
 
     let upstream = MockUpstream::default();
     // Round 1: model calls web_search
@@ -2242,7 +2325,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
                 id: "reasoning_1".to_string(),
                 summary: vec![],
                 content: Some(vec![
-                    resp2chat::models::responses::ReasoningContentItem::ReasoningText {
+                    llmconduit::models::responses::ReasoningContentItem::ReasoningText {
                         text: "Let me look at the files.".to_string(),
                     },
                 ]),
@@ -2500,7 +2583,7 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         tools: Vec::new(),
         tool_choice: json!("auto"),
         parallel_tool_calls: true,
-        reasoning: Some(resp2chat::models::responses::ReasoningRequest {
+        reasoning: Some(llmconduit::models::responses::ReasoningRequest {
             effort: Some("medium".to_string()),
             summary: None,
         }),
@@ -2652,7 +2735,7 @@ fn usage_chunk(
 }
 
 async fn collect_stream(
-    stream: tokio_stream::wrappers::ReceiverStream<resp2chat::engine::SseEvent>,
+    stream: tokio_stream::wrappers::ReceiverStream<llmconduit::engine::SseEvent>,
 ) -> Vec<serde_json::Value> {
     stream
         .map(|event| {
@@ -2739,7 +2822,7 @@ async fn chat_completions_returns_non_streaming_json() {
         ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
         "model": "glm-5.1",
@@ -2793,6 +2876,95 @@ async fn chat_completions_returns_non_streaming_json() {
 }
 
 #[tokio::test]
+async fn chat_completions_preserves_multimodal_content_parts() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Describe these inputs" },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,abc",
+                            "detail": "high"
+                        }
+                    },
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": "UklGRg==",
+                            "format": "wav"
+                        }
+                    },
+                    {
+                        "type": "file",
+                        "file": {
+                            "file_id": "file_doc"
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages[0].content.as_ref(),
+        Some(&json!([
+            { "type": "text", "text": "Describe these inputs" },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,abc",
+                    "detail": "high"
+                }
+            },
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "UklGRg==",
+                    "format": "wav"
+                }
+            },
+            {
+                "type": "file",
+                "file": {
+                    "file_id": "file_doc"
+                }
+            }
+        ]))
+    );
+}
+
+#[tokio::test]
 async fn chat_completions_streams_openai_sse() {
     let upstream = MockUpstream::default();
     upstream
@@ -2803,7 +2975,7 @@ async fn chat_completions_streams_openai_sse() {
         ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
         "model": "glm-5.1",
@@ -2873,7 +3045,7 @@ async fn chat_completions_web_search_is_server_side_and_hidden() {
         .await;
     let search = MockSearch::default();
     let gateway = test_gateway(upstream.clone(), search.clone());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
         "model": "glm-5.1",
@@ -2959,7 +3131,7 @@ async fn chat_completions_client_tool_call_surfaces_tool_calls() {
         ))])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
         "model": "glm-5.1",
@@ -3019,7 +3191,7 @@ async fn chat_completions_developer_messages_become_system_messages() {
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
         "model": "glm-5.1",
@@ -3074,6 +3246,62 @@ async fn chat_completions_developer_messages_become_system_messages() {
     );
 }
 
+#[tokio::test]
+async fn chat_completions_prepends_profile_system_prompt_prefix() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_model: None,
+            system_prompt_prefix: Some("Profile prefix.".to_string()),
+            upstream_chat_kwargs: JsonMap::new(),
+        },
+    )]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [
+            { "role": "system", "content": "Client system." },
+            { "role": "user", "content": "Hi" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages[0]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("Profile prefix.\n\nClient system.")
+    );
+    assert_eq!(requests[0].messages[1].role, "user");
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic /v1/messages integration tests
 // ---------------------------------------------------------------------------
@@ -3089,7 +3317,7 @@ async fn anthropic_messages_streams_text_response() {
         ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
         "model": "claude-3-5-sonnet-20241022",
@@ -3163,6 +3391,94 @@ async fn anthropic_messages_streams_text_response() {
 }
 
 #[tokio::test]
+async fn anthropic_messages_preserves_image_content_parts() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": false,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Inspect these" },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc"
+                        }
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/img.png"
+                        }
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "file",
+                            "file_id": "file_img"
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages[0].content.as_ref(),
+        Some(&json!([
+            { "type": "text", "text": "Inspect these" },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,abc"
+                }
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/img.png"
+                }
+            },
+            {
+                "type": "input_image",
+                "file_id": "file_img"
+            }
+        ]))
+    );
+}
+
+#[tokio::test]
 async fn anthropic_messages_forwards_output_config_as_response_format() {
     let upstream = MockUpstream::default();
     upstream
@@ -3172,7 +3488,7 @@ async fn anthropic_messages_forwards_output_config_as_response_format() {
         ))])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
     let schema = json!({
         "type": "object",
         "additionalProperties": false,
@@ -3257,7 +3573,7 @@ async fn anthropic_messages_streams_tool_use_response() {
         ))])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
         "model": "claude-3-5-sonnet-20241022",
@@ -3333,7 +3649,7 @@ async fn anthropic_messages_converts_system_prompt() {
         .push_response(vec![Ok(content_chunk("chat-1", "done"))])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
         "model": "claude-3-5-sonnet-20241022",
@@ -3376,13 +3692,67 @@ async fn anthropic_messages_converts_system_prompt() {
 }
 
 #[tokio::test]
+async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "done"))])
+        .await;
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "claude-3-5-sonnet-20241022".to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_model: None,
+            system_prompt_prefix: Some("Profile prefix.".to_string()),
+            upstream_chat_kwargs: JsonMap::new(),
+        },
+    )]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "system": "You are a helpful assistant.",
+        "messages": [
+            { "role": "user", "content": "Hi" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages[0]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("Profile prefix.\n\nYou are a helpful assistant.")
+    );
+}
+
+#[tokio::test]
 async fn anthropic_messages_returns_non_streaming_json() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
         "model": "claude-3-5-sonnet-20241022",
@@ -3422,7 +3792,7 @@ async fn responses_returns_non_streaming_json_while_streaming_upstream() {
         .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
         "model": "glm-5.1",
@@ -3478,13 +3848,99 @@ async fn responses_returns_non_streaming_json_while_streaming_upstream() {
 }
 
 #[tokio::test]
+async fn responses_preserves_multimodal_input_parts() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Inspect these" },
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,abc",
+                        "detail": "high"
+                    },
+                    {
+                        "type": "input_file",
+                        "file_id": "file_doc",
+                        "filename": "brief.pdf"
+                    },
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": "UklGRg==",
+                            "format": "wav"
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages[0].content.as_ref(),
+        Some(&json!([
+            { "type": "text", "text": "Inspect these" },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,abc",
+                    "detail": "high"
+                }
+            },
+            {
+                "type": "input_file",
+                "file_id": "file_doc",
+                "filename": "brief.pdf"
+            },
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "UklGRg==",
+                    "format": "wav"
+                }
+            }
+        ]))
+    );
+}
+
+#[tokio::test]
 async fn anthropic_messages_converts_tool_result_history() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-2", "It's 72°F in Seattle."))])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
-    let app = resp2chat::build_app_from_gateway(gateway);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
         "model": "claude-3-5-sonnet-20241022",

@@ -186,21 +186,44 @@ fn chat_content_part_to_response_content(role: &str, part: &Value) -> Option<Con
     let object = part.as_object()?;
     let kind = object.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
-        "image_url" | "input_image" => extract_image_url(object).map(|image_url| {
+        "image_url" => extract_image_url(object).map(|image_url| {
             if role == "assistant" {
-                text_content_item(
-                    role,
-                    json!({ "type": kind, "image_url": image_url }).to_string(),
-                )
+                text_content_item(role, part.to_string())
             } else {
-                ContentItem::InputImage { image_url }
+                ContentItem::InputImage {
+                    image_url: Some(image_url),
+                    file_id: None,
+                    detail: extract_image_detail(object),
+                }
             }
         }),
+        "input_image" => {
+            if role == "assistant" {
+                return Some(text_content_item(role, part.to_string()));
+            }
+            Some(ContentItem::InputImage {
+                image_url: extract_image_url(object),
+                file_id: optional_string(object, "file_id"),
+                detail: extract_image_detail(object),
+            })
+        }
+        "input_file" => {
+            if role == "assistant" {
+                return Some(text_content_item(role, part.to_string()));
+            }
+            Some(ContentItem::InputFile {
+                file_id: optional_string(object, "file_id"),
+                file_url: optional_string(object, "file_url"),
+                filename: optional_string(object, "filename"),
+                file_data: optional_string(object, "file_data"),
+            })
+        }
         "text" | "input_text" | "output_text" => object
             .get("text")
             .and_then(Value::as_str)
             .map(|text| text_content_item(role, text.to_string())),
-        _ => Some(text_content_item(role, part.to_string())),
+        _ if role == "assistant" => Some(text_content_item(role, part.to_string())),
+        _ => Some(ContentItem::Other(part.clone())),
     }
 }
 
@@ -232,6 +255,22 @@ fn extract_image_url(object: &serde_json::Map<String, Value>) -> Option<String> 
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
+}
+
+fn extract_image_detail(object: &serde_json::Map<String, Value>) -> Option<String> {
+    optional_string(object, "detail").or_else(|| {
+        object
+            .get("image_url")
+            .and_then(Value::as_object)
+            .and_then(|map| optional_string(map, "detail"))
+    })
+}
+
+fn optional_string(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn text_content_item(role: &str, text: String) -> ContentItem {

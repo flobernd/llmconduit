@@ -4,6 +4,8 @@ use crate::adapters::chat_completions::ChatCompletionCollector;
 use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
+use crate::debug_ui::debug_index;
+use crate::debug_ui::debug_ws;
 use crate::engine::Gateway;
 use crate::error::AppError;
 use crate::error::AppResult;
@@ -49,13 +51,28 @@ const API_LOG_PAYLOAD_DUMP_LIMIT_BYTES: usize = 16 * 1024;
 const API_LOG_PREVIEW_CHARS: usize = 160;
 const UNKNOWN_MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
 
-pub fn build_router(gateway: Arc<Gateway>) -> Router {
-    Router::new()
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RouterOptions {
+    pub with_debug_ui: bool,
+}
+
+pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
+    let router = Router::new()
         .route("/v1/responses", post(post_responses))
         .route("/v1/messages", post(post_messages))
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/completions", post(post_completions))
-        .route("/v1/models", get(get_models))
+        .route("/v1/models", get(get_models));
+
+    let router = if options.with_debug_ui {
+        router
+            .route("/debug", get(debug_index))
+            .route("/debug/ws", get(debug_ws))
+    } else {
+        router
+    };
+
+    router
         .fallback(api_not_found)
         .layer(middleware::from_fn(log_api_call))
         .with_state(gateway)

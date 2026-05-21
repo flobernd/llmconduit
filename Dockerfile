@@ -12,11 +12,12 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 
 ENV HOME=/home/nonroot \
     XDG_CONFIG_HOME=/home/nonroot/.config \
+    LLMCONDUIT_BIND_ADDR=0.0.0.0:4000 \
     RUST_LOG=info
 
-COPY --from=builder /app/target/release/resp2chat /usr/local/bin/resp2chat
+COPY --from=builder /app/target/release/llmconduit /usr/local/bin/llmconduit
 
 EXPOSE 4000
 
-ENTRYPOINT ["/usr/local/bin/resp2chat"]
+ENTRYPOINT ["/usr/local/bin/llmconduit"]
 CMD ["start"]

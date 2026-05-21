@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod cli;
 pub mod config;
+pub mod debug_ui;
 pub mod engine;
 pub mod error;
 pub mod http;
@@ -10,11 +11,11 @@ pub mod raw;
 pub mod replay;
 pub mod request_log;
 pub mod search;
-pub mod ui;
 pub mod upstream;
 
 use crate::config::Config;
 use crate::engine::Gateway;
+use crate::http::RouterOptions;
 use crate::http::build_router;
 use crate::monitor::MonitorHub;
 use crate::raw::RawOutput;
@@ -28,6 +29,10 @@ pub fn build_app(config: Config) -> axum::Router {
     build_app_with_gateway(config).0
 }
 
+pub fn build_app_with_options(config: Config, options: AppOptions) -> axum::Router {
+    build_app_with_gateway_and_options(config, None, options).0
+}
+
 pub fn build_app_with_gateway(config: Config) -> (axum::Router, Arc<Gateway>) {
     build_app_with_gateway_and_raw_output(config, None)
 }
@@ -36,13 +41,25 @@ pub fn build_app_with_gateway_and_raw_output(
     config: Config,
     raw_output: Option<RawOutput>,
 ) -> (axum::Router, Arc<Gateway>) {
+    build_app_with_gateway_and_options(config, raw_output, AppOptions::default())
+}
+
+pub fn build_app_with_gateway_and_options(
+    config: Config,
+    raw_output: Option<RawOutput>,
+    options: AppOptions,
+) -> (axum::Router, Arc<Gateway>) {
     let http_client = reqwest::Client::builder()
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .build()
         .expect("reqwest client");
     let replay_store = ReplayStore::new(config.max_replay_entries);
-    let monitor = MonitorHub::new(512);
+    let monitor = if options.with_debug_ui {
+        MonitorHub::new(512)
+    } else {
+        MonitorHub::disabled()
+    };
     let upstream = Arc::new(ReqwestUpstreamClient::new(
         http_client.clone(),
         config.upstream_base_url.clone(),
@@ -59,10 +76,30 @@ pub fn build_app_with_gateway_and_raw_output(
         monitor,
         raw_output,
     ));
-    let app = build_router(Arc::clone(&gateway));
+    let app = build_router(Arc::clone(&gateway), options.into());
     (app, gateway)
 }
 
 pub fn build_app_from_gateway(gateway: Arc<Gateway>) -> axum::Router {
-    build_router(gateway)
+    build_app_from_gateway_with_options(gateway, AppOptions::default())
+}
+
+pub fn build_app_from_gateway_with_options(
+    gateway: Arc<Gateway>,
+    options: AppOptions,
+) -> axum::Router {
+    build_router(gateway, options.into())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppOptions {
+    pub with_debug_ui: bool,
+}
+
+impl From<AppOptions> for RouterOptions {
+    fn from(options: AppOptions) -> Self {
+        Self {
+            with_debug_ui: options.with_debug_ui,
+        }
+    }
 }

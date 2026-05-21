@@ -732,17 +732,7 @@ fn message_content_to_chat_value(content: &[ContentItem]) -> AppResult<Value> {
     }
     let mut parts = Vec::with_capacity(content.len());
     for item in content {
-        let value = match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => json!({
-                "type": "text",
-                "text": text,
-            }),
-            ContentItem::InputImage { image_url } => json!({
-                "type": "image_url",
-                "image_url": { "url": image_url }
-            }),
-        };
-        parts.push(value);
+        parts.push(content_item_to_chat_part(item));
     }
     Ok(Value::Array(parts))
 }
@@ -752,10 +742,69 @@ fn content_item_to_chat_value(item: &ContentItem) -> AppResult<Value> {
         ContentItem::InputText { text } | ContentItem::OutputText { text } => {
             Ok(Value::String(text.clone()))
         }
-        ContentItem::InputImage { image_url } => Ok(json!([{
-            "type": "image_url",
-            "image_url": { "url": image_url }
-        }])),
+        ContentItem::InputImage { .. } | ContentItem::InputFile { .. } | ContentItem::Other(_) => {
+            Ok(Value::Array(vec![content_item_to_chat_part(item)]))
+        }
+    }
+}
+
+fn content_item_to_chat_part(item: &ContentItem) -> Value {
+    match item {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } => json!({
+            "type": "text",
+            "text": text,
+        }),
+        ContentItem::InputImage {
+            image_url: Some(image_url),
+            detail,
+            ..
+        } => {
+            let mut image_url_value = Map::new();
+            image_url_value.insert("url".to_string(), Value::String(image_url.clone()));
+            if let Some(detail) = detail {
+                image_url_value.insert("detail".to_string(), Value::String(detail.clone()));
+            }
+            json!({
+                "type": "image_url",
+                "image_url": Value::Object(image_url_value)
+            })
+        }
+        ContentItem::InputImage {
+            image_url: None,
+            file_id,
+            detail,
+        } => {
+            let mut part = Map::new();
+            part.insert("type".to_string(), Value::String("input_image".to_string()));
+            if let Some(file_id) = file_id {
+                part.insert("file_id".to_string(), Value::String(file_id.clone()));
+            }
+            if let Some(detail) = detail {
+                part.insert("detail".to_string(), Value::String(detail.clone()));
+            }
+            Value::Object(part)
+        }
+        ContentItem::InputFile {
+            file_id,
+            file_url,
+            filename,
+            file_data,
+        } => {
+            let mut part = Map::new();
+            part.insert("type".to_string(), Value::String("input_file".to_string()));
+            insert_optional_string(&mut part, "file_id", file_id);
+            insert_optional_string(&mut part, "file_url", file_url);
+            insert_optional_string(&mut part, "filename", filename);
+            insert_optional_string(&mut part, "file_data", file_data);
+            Value::Object(part)
+        }
+        ContentItem::Other(value) => value.clone(),
+    }
+}
+
+fn insert_optional_string(map: &mut Map<String, Value>, key: &str, value: &Option<String>) {
+    if let Some(value) = value {
+        map.insert(key.to_string(), Value::String(value.clone()));
     }
 }
 
@@ -968,7 +1017,9 @@ mod tests {
                 text: "hi".to_string(),
             },
             ContentItem::InputImage {
-                image_url: "http://img.png".to_string(),
+                image_url: Some("http://img.png".to_string()),
+                file_id: None,
+                detail: None,
             },
         ];
         let value = message_content_to_chat_value(&content).unwrap();
@@ -977,16 +1028,36 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], "text");
         assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(arr[1]["image_url"]["url"], "http://img.png");
     }
 
     #[test]
     fn single_input_image_wraps_as_array() {
         let item = ContentItem::InputImage {
-            image_url: "http://img.png".to_string(),
+            image_url: Some("http://img.png".to_string()),
+            file_id: None,
+            detail: Some("high".to_string()),
         };
         let value = content_item_to_chat_value(&item).unwrap();
         assert!(value.is_array());
         assert_eq!(value[0]["type"], "image_url");
+        assert_eq!(value[0]["image_url"]["url"], "http://img.png");
+        assert_eq!(value[0]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn input_file_passes_through_as_content_part() {
+        let item = ContentItem::InputFile {
+            file_id: Some("file_123".to_string()),
+            file_url: None,
+            filename: Some("brief.pdf".to_string()),
+            file_data: None,
+        };
+        let value = content_item_to_chat_value(&item).unwrap();
+        assert!(value.is_array());
+        assert_eq!(value[0]["type"], "input_file");
+        assert_eq!(value[0]["file_id"], "file_123");
+        assert_eq!(value[0]["filename"], "brief.pdf");
     }
 
     #[test]

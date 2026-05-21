@@ -29,6 +29,7 @@ use crate::models::responses::ResponseUsage;
 use crate::models::responses::ResponsesEnvelope;
 use crate::models::responses::ResponsesRequest;
 use crate::models::responses::WebSearchAction;
+use crate::monitor::DebugEventImage;
 use crate::monitor::MonitorEventKind;
 use crate::monitor::MonitorHub;
 use crate::raw::RawOutput;
@@ -36,6 +37,7 @@ use crate::replay::ReplayRecord;
 use crate::replay::ReplayStore;
 use crate::search::SearchClient;
 use crate::upstream::UpstreamClient;
+use crate::upstream::sanitize_chat_request;
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
@@ -249,8 +251,12 @@ impl Gateway {
 
     pub fn subscribe_monitor(
         &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::monitor::MonitorEvent> {
+    ) -> tokio::sync::broadcast::Receiver<crate::monitor::DebugUpdate> {
         self.monitor.subscribe()
+    }
+
+    pub fn debug_snapshot(&self) -> crate::monitor::DebugSnapshot {
+        self.monitor.snapshot()
     }
 
     async fn send_event(
@@ -275,6 +281,7 @@ impl Gateway {
         self: Arc<Self>,
         request: ResponsesRequest,
     ) -> AppResult<ReceiverStream<SseEvent>> {
+        let request = self.apply_system_prompt_prefix(request);
         let (baseline_record, prefix_len) = self.find_replay_baseline(&request).await?;
         let mut tail_request = request.clone();
         tail_request.input = request.input[prefix_len..].to_vec();
@@ -329,6 +336,18 @@ impl Gateway {
             }
         });
         Ok(ReceiverStream::new(rx))
+    }
+
+    fn apply_system_prompt_prefix(&self, mut request: ResponsesRequest) -> ResponsesRequest {
+        let Some(prefix) = self.config.resolve_system_prompt_prefix(&request.model) else {
+            return request;
+        };
+        request.instructions = if request.instructions.is_empty() {
+            prefix
+        } else {
+            format!("{prefix}\n\n{}", request.instructions)
+        };
+        request
     }
 
     async fn find_replay_baseline(
@@ -478,7 +497,29 @@ impl Gateway {
                                 }
                                 crate::models::responses::ContentItem::InputImage {
                                     image_url,
-                                } => image_url.chars().count(),
+                                    file_id,
+                                    detail,
+                                } => image_url
+                                    .iter()
+                                    .chain(file_id.iter())
+                                    .chain(detail.iter())
+                                    .map(|value| value.chars().count())
+                                    .sum(),
+                                crate::models::responses::ContentItem::InputFile {
+                                    file_id,
+                                    file_url,
+                                    filename,
+                                    file_data,
+                                } => file_id
+                                    .iter()
+                                    .chain(file_url.iter())
+                                    .chain(filename.iter())
+                                    .chain(file_data.iter())
+                                    .map(|value| value.chars().count())
+                                    .sum(),
+                                crate::models::responses::ContentItem::Other(value) => {
+                                    value.to_string().chars().count()
+                                }
                             })
                             .sum::<usize>(),
                         ResponseItem::Reasoning { content, .. } => content
@@ -578,6 +619,16 @@ impl Gateway {
                 instructions_chars: request.instructions.chars().count(),
             },
         );
+        if self.monitor.is_enabled() {
+            let request_preview = preview_json_limited_with_images(&request, 128 * 1024);
+            self.monitor.emit(
+                response_id.clone(),
+                MonitorEventKind::RequestPayload {
+                    payload_preview: request_preview.text,
+                    images: request_preview.images,
+                },
+            );
+        }
         for item in trailing_tool_output_items(&request.input) {
             self.monitor.emit(
                 response_id.clone(),
@@ -646,75 +697,83 @@ impl Gateway {
                 presence_penalty: request.presence_penalty,
                 extra_body: upstream_extra_body.clone(),
             };
-            self.monitor.emit(
-                response_id.clone(),
-                MonitorEventKind::UpstreamRequest {
-                    request_index: upstream_request_index,
-                    message_count: upstream_request.messages.len(),
-                    prompt_chars: upstream_request
-                        .messages
-                        .iter()
-                        .map(|message| {
-                            message.role.chars().count()
-                                + message
-                                    .name
-                                    .as_ref()
-                                    .map(|name| name.chars().count())
-                                    .unwrap_or(0)
-                                + message
-                                    .tool_call_id
-                                    .as_ref()
-                                    .map(|call_id| call_id.chars().count())
-                                    .unwrap_or(0)
-                                + message
-                                    .reasoning_content
-                                    .as_ref()
-                                    .map(|text| text.chars().count())
-                                    .unwrap_or(0)
-                                + message
-                                    .content
-                                    .as_ref()
-                                    .map(|content| content.to_string().chars().count())
-                                    .unwrap_or(0)
-                                + message
-                                    .tool_calls
-                                    .as_ref()
-                                    .map(|tool_calls| {
-                                        tool_calls
-                                            .iter()
-                                            .map(|tool_call| {
-                                                serde_json::to_string(tool_call)
-                                                    .unwrap_or_default()
-                                                    .chars()
-                                                    .count()
-                                            })
-                                            .sum::<usize>()
-                                    })
-                                    .unwrap_or(0)
-                        })
-                        .sum::<usize>()
-                        + upstream_request
-                            .tools
-                            .as_ref()
-                            .map(|tools| {
-                                tools
-                                    .iter()
-                                    .map(|tool| {
-                                        serde_json::to_string(tool)
-                                            .unwrap_or_default()
-                                            .chars()
-                                            .count()
-                                    })
-                                    .sum::<usize>()
+            if self.monitor.is_enabled() {
+                let upstream_debug_request =
+                    sanitize_chat_request(upstream_request.clone(), self.config.flatten_content);
+                let upstream_preview =
+                    preview_json_limited_with_images(&upstream_debug_request, 128 * 1024);
+                self.monitor.emit(
+                    response_id.clone(),
+                    MonitorEventKind::UpstreamRequest {
+                        request_index: upstream_request_index,
+                        message_count: upstream_debug_request.messages.len(),
+                        prompt_chars: upstream_debug_request
+                            .messages
+                            .iter()
+                            .map(|message| {
+                                message.role.chars().count()
+                                    + message
+                                        .name
+                                        .as_ref()
+                                        .map(|name| name.chars().count())
+                                        .unwrap_or(0)
+                                    + message
+                                        .tool_call_id
+                                        .as_ref()
+                                        .map(|call_id| call_id.chars().count())
+                                        .unwrap_or(0)
+                                    + message
+                                        .reasoning_content
+                                        .as_ref()
+                                        .map(|text| text.chars().count())
+                                        .unwrap_or(0)
+                                    + message
+                                        .content
+                                        .as_ref()
+                                        .map(|content| content.to_string().chars().count())
+                                        .unwrap_or(0)
+                                    + message
+                                        .tool_calls
+                                        .as_ref()
+                                        .map(|tool_calls| {
+                                            tool_calls
+                                                .iter()
+                                                .map(|tool_call| {
+                                                    serde_json::to_string(tool_call)
+                                                        .unwrap_or_default()
+                                                        .chars()
+                                                        .count()
+                                                })
+                                                .sum::<usize>()
+                                        })
+                                        .unwrap_or(0)
                             })
-                            .unwrap_or(0)
-                        + upstream_request
-                            .extra_body
-                            .values()
-                            .map(|value| value.to_string().chars().count())
-                            .sum::<usize>(),
-                },
-            );
+                            .sum::<usize>()
+                            + upstream_debug_request
+                                .tools
+                                .as_ref()
+                                .map(|tools| {
+                                    tools
+                                        .iter()
+                                        .map(|tool| {
+                                            serde_json::to_string(tool)
+                                                .unwrap_or_default()
+                                                .chars()
+                                                .count()
+                                        })
+                                        .sum::<usize>()
+                                })
+                                .unwrap_or(0)
+                            + upstream_debug_request
+                                .extra_body
+                                .values()
+                                .map(|value| value.to_string().chars().count())
+                                .sum::<usize>(),
+                        payload_preview: upstream_preview.text,
+                        images: upstream_preview.images,
+                    },
+                );
+            }
             if tx.is_closed() {
                 return Err(AppError::cancelled());
             }
@@ -972,6 +1031,17 @@ impl Gateway {
                 None
             },
         };
+        if self.monitor.is_enabled() {
+            let final_preview = preview_json_limited_with_images(&resource, 128 * 1024);
+            self.monitor.emit(
+                response_id.clone(),
+                MonitorEventKind::FinalResponse {
+                    status: resource.status.clone(),
+                    payload_preview: final_preview.text,
+                    images: final_preview.images,
+                },
+            );
+        }
         if is_incomplete {
             self.send_event(
                 &tx,
@@ -1361,18 +1431,151 @@ fn preview_json<T>(value: &T) -> String
 where
     T: Serialize,
 {
-    const LIMIT: usize = 4_000;
-    let rendered = serde_json::to_string_pretty(value)
-        .unwrap_or_else(|err| format!("{{\"serialization_error\":\"{err}\"}}"));
-    if rendered.chars().count() <= LIMIT {
-        rendered
+    preview_json_limited(value, 4_000)
+}
+
+fn preview_json_limited<T>(value: &T, limit: usize) -> String
+where
+    T: Serialize,
+{
+    preview_json_limited_with_images(value, limit).text
+}
+
+#[derive(Debug)]
+struct JsonPreview {
+    text: String,
+    images: Vec<DebugEventImage>,
+}
+
+fn preview_json_limited_with_images<T>(value: &T, limit: usize) -> JsonPreview
+where
+    T: Serialize,
+{
+    let mut images = Vec::new();
+    let rendered = match serde_json::to_value(value) {
+        Ok(mut value) => {
+            redact_data_image_urls(&mut value, "$", &mut images);
+            serde_json::to_string_pretty(&value)
+        }
+        Err(err) => Err(err),
+    }
+    .unwrap_or_else(|err| format!("{{\"serialization_error\":\"{err}\"}}"));
+    if rendered.chars().count() <= limit {
+        JsonPreview {
+            text: rendered,
+            images,
+        }
     } else {
         let end = rendered
             .char_indices()
-            .nth(LIMIT)
+            .nth(limit)
             .map(|(index, _)| index)
             .unwrap_or(rendered.len());
-        format!("{}...\n[truncated]", &rendered[..end])
+        JsonPreview {
+            text: format!("{}...\n[truncated]", &rendered[..end]),
+            images,
+        }
+    }
+}
+
+fn redact_data_image_urls(value: &mut Value, path: &str, images: &mut Vec<DebugEventImage>) {
+    match value {
+        Value::String(text) => {
+            if let Some(image) = extract_data_image(text, path, images.len() + 1) {
+                *text = redacted_data_image_label(&image);
+                images.push(image);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                redact_data_image_urls(item, &format!("{path}[{index}]"), images);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                redact_data_image_urls(item, &json_path_child(path, key), images);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn extract_data_image(value: &str, path: &str, index: usize) -> Option<DebugEventImage> {
+    if !value.starts_with("data:image/") {
+        return None;
+    }
+    let comma_index = value.find(',')?;
+    let header = &value["data:".len()..comma_index];
+    if !header
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+    let mime_type = header
+        .split(';')
+        .next()
+        .filter(|part| part.starts_with("image/"))?
+        .to_string();
+    Some(DebugEventImage {
+        id: format!("image-{index}"),
+        label: format!("image {index}"),
+        path: path.to_string(),
+        mime_type,
+        size_bytes: estimate_base64_payload_bytes(&value[comma_index + 1..]),
+        src: value.to_string(),
+    })
+}
+
+fn redacted_data_image_label(image: &DebugEventImage) -> String {
+    match image.size_bytes {
+        Some(size_bytes) => format!(
+            "data:{};base64,<redacted {}>",
+            image.mime_type,
+            format_byte_count(size_bytes)
+        ),
+        None => format!("data:{};base64,<redacted>", image.mime_type),
+    }
+}
+
+fn estimate_base64_payload_bytes(encoded: &str) -> Option<usize> {
+    let base64_len = encoded.chars().filter(|ch| !ch.is_whitespace()).count();
+    if base64_len == 0 {
+        return Some(0);
+    }
+    let padding = encoded
+        .chars()
+        .rev()
+        .filter(|ch| !ch.is_whitespace())
+        .take_while(|ch| *ch == '=')
+        .count()
+        .min(2);
+    Some((base64_len.saturating_mul(3) / 4).saturating_sub(padding))
+}
+
+fn format_byte_count(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn json_path_child(parent: &str, key: &str) -> String {
+    if key
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        format!("{parent}.{key}")
+    } else {
+        format!(
+            "{parent}[{}]",
+            serde_json::to_string(key).unwrap_or_default()
+        )
     }
 }
 
@@ -1452,6 +1655,18 @@ fn summarize_content(content: &[crate::models::responses::ContentItem]) -> Strin
                 }
                 text.push_str("[image]");
             }
+            crate::models::responses::ContentItem::InputFile { .. } => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str("[file]");
+            }
+            crate::models::responses::ContentItem::Other(_) => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str("[input]");
+            }
         }
     }
     preview_text(&text)
@@ -1493,6 +1708,7 @@ fn preview_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::preview_json;
+    use super::preview_json_limited_with_images;
     use super::preview_text;
     use super::trailing_tool_output_items;
     use crate::models::responses::ResponseItem;
@@ -1514,6 +1730,26 @@ mod tests {
         let preview = preview_json(&value);
         assert!(preview.ends_with("...\n[truncated]"));
         assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
+    fn preview_json_redacts_data_image_urls_and_collects_images() {
+        let data_url = "data:image/jpeg;base64,/9j/AA==";
+        let value = json!({
+            "type": "input_image",
+            "image_url": data_url,
+            "text": "keep me visible"
+        });
+
+        let preview = preview_json_limited_with_images(&value, 4_000);
+
+        assert!(preview.text.contains("keep me visible"));
+        assert!(preview.text.contains("data:image/jpeg;base64,<redacted"));
+        assert!(!preview.text.contains("/9j/AA=="));
+        assert_eq!(preview.images.len(), 1);
+        assert_eq!(preview.images[0].src, data_url);
+        assert_eq!(preview.images[0].mime_type, "image/jpeg");
+        assert_eq!(preview.images[0].path, "$.image_url");
     }
 
     #[test]

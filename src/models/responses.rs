@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
+use serde::ser::SerializeMap;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -173,12 +174,148 @@ pub struct TextFormat {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ContentItem {
-    InputText { text: String },
-    InputImage { image_url: String },
-    OutputText { text: String },
+    InputText {
+        text: String,
+    },
+    InputImage {
+        image_url: Option<String>,
+        file_id: Option<String>,
+        detail: Option<String>,
+    },
+    InputFile {
+        file_id: Option<String>,
+        file_url: Option<String>,
+        filename: Option<String>,
+        file_data: Option<String>,
+    },
+    OutputText {
+        text: String,
+    },
+    Other(Value),
+}
+
+impl Serialize for ContentItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            ContentItem::InputText { text } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "input_text")?;
+                map.serialize_entry("text", text)?;
+                map.end()
+            }
+            ContentItem::InputImage {
+                image_url,
+                file_id,
+                detail,
+            } => {
+                let len = 1
+                    + usize::from(image_url.is_some())
+                    + usize::from(file_id.is_some())
+                    + usize::from(detail.is_some());
+                let mut map = serializer.serialize_map(Some(len))?;
+                map.serialize_entry("type", "input_image")?;
+                if let Some(image_url) = image_url {
+                    map.serialize_entry("image_url", image_url)?;
+                }
+                if let Some(file_id) = file_id {
+                    map.serialize_entry("file_id", file_id)?;
+                }
+                if let Some(detail) = detail {
+                    map.serialize_entry("detail", detail)?;
+                }
+                map.end()
+            }
+            ContentItem::InputFile {
+                file_id,
+                file_url,
+                filename,
+                file_data,
+            } => {
+                let len = 1
+                    + usize::from(file_id.is_some())
+                    + usize::from(file_url.is_some())
+                    + usize::from(filename.is_some())
+                    + usize::from(file_data.is_some());
+                let mut map = serializer.serialize_map(Some(len))?;
+                map.serialize_entry("type", "input_file")?;
+                if let Some(file_id) = file_id {
+                    map.serialize_entry("file_id", file_id)?;
+                }
+                if let Some(file_url) = file_url {
+                    map.serialize_entry("file_url", file_url)?;
+                }
+                if let Some(filename) = filename {
+                    map.serialize_entry("filename", filename)?;
+                }
+                if let Some(file_data) = file_data {
+                    map.serialize_entry("file_data", file_data)?;
+                }
+                map.end()
+            }
+            ContentItem::OutputText { text } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "output_text")?;
+                map.serialize_entry("text", text)?;
+                map.end()
+            }
+            ContentItem::Other(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Some(object) = value.as_object() else {
+            return Ok(ContentItem::Other(value));
+        };
+        Ok(match object.get("type").and_then(Value::as_str) {
+            Some("input_text") => ContentItem::InputText {
+                text: optional_string(object, "text").unwrap_or_default(),
+            },
+            Some("input_image") => ContentItem::InputImage {
+                image_url: optional_image_url(object),
+                file_id: optional_string(object, "file_id"),
+                detail: optional_string(object, "detail"),
+            },
+            Some("input_file") => ContentItem::InputFile {
+                file_id: optional_string(object, "file_id"),
+                file_url: optional_string(object, "file_url"),
+                filename: optional_string(object, "filename"),
+                file_data: optional_string(object, "file_data"),
+            },
+            Some("output_text") => ContentItem::OutputText {
+                text: optional_string(object, "text").unwrap_or_default(),
+            },
+            _ => ContentItem::Other(value),
+        })
+    }
+}
+
+fn optional_string(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn optional_image_url(object: &serde_json::Map<String, Value>) -> Option<String> {
+    object.get("image_url").and_then(|value| match value {
+        Value::String(url) => Some(url.clone()),
+        Value::Object(map) => map
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -525,6 +662,33 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
         assert_eq!(item, roundtripped);
+    }
+
+    #[test]
+    fn content_item_multimodal_serde_roundtrip() {
+        let items = vec![
+            ContentItem::InputImage {
+                image_url: None,
+                file_id: Some("file_img".to_string()),
+                detail: Some("high".to_string()),
+            },
+            ContentItem::InputFile {
+                file_id: Some("file_doc".to_string()),
+                file_url: None,
+                filename: Some("brief.pdf".to_string()),
+                file_data: None,
+            },
+            ContentItem::Other(serde_json::json!({
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "abc",
+                    "format": "wav"
+                }
+            })),
+        ];
+        let json = serde_json::to_string(&items).unwrap();
+        let roundtripped: Vec<ContentItem> = serde_json::from_str(&json).unwrap();
+        assert_eq!(items, roundtripped);
     }
 
     #[test]

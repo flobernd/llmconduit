@@ -34,6 +34,8 @@ pub struct Config {
 pub struct PersistedModelProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
@@ -41,6 +43,7 @@ pub struct PersistedModelProfile {
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
     pub upstream_model: Option<String>,
+    pub system_prompt_prefix: Option<String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
 
@@ -171,6 +174,11 @@ impl Config {
                                 .as_ref()
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty()),
+                            system_prompt_prefix: profile
+                                .system_prompt_prefix
+                                .as_ref()
+                                .filter(|value| !value.trim().is_empty())
+                                .cloned(),
                             upstream_chat_kwargs: profile.upstream_chat_kwargs.clone(),
                         },
                     ))
@@ -200,10 +208,39 @@ impl Config {
 
     pub fn resolve_upstream_chat_kwargs(&self, request_model: &str) -> JsonMap<String, JsonValue> {
         let mut kwargs = self.upstream_chat_kwargs.clone();
-        if let Some(profile) = self.model_profile(request_model) {
+        let upstream_model = self.resolve_upstream_model(request_model);
+        for profile in self.model_profiles_for_request(request_model, &upstream_model) {
             merge_json_maps(&mut kwargs, &profile.upstream_chat_kwargs);
         }
         kwargs
+    }
+
+    pub fn resolve_system_prompt_prefix(&self, request_model: &str) -> Option<String> {
+        let upstream_model = self.resolve_upstream_model(request_model);
+        self.model_profiles_for_request(request_model, &upstream_model)
+            .into_iter()
+            .rev()
+            .find_map(|profile| profile.system_prompt_prefix.clone())
+    }
+
+    fn model_profiles_for_request(
+        &self,
+        request_model: &str,
+        upstream_model: &str,
+    ) -> Vec<&ModelProfile> {
+        let mut profiles = Vec::new();
+        if let Some(profile) = self.model_profile(upstream_model) {
+            profiles.push(profile);
+        }
+        if request_model != upstream_model
+            && let Some(profile) = self.model_profile(request_model)
+            && !profiles
+                .iter()
+                .any(|existing| std::ptr::eq(*existing, profile))
+        {
+            profiles.push(profile);
+        }
+        profiles
     }
 
     fn model_profile(&self, request_model: &str) -> Option<&ModelProfile> {
@@ -219,7 +256,7 @@ impl Config {
 pub fn default_config_path() -> Result<PathBuf, String> {
     let config_dir = dirs::config_dir()
         .ok_or_else(|| "unable to determine configuration directory".to_string())?;
-    Ok(config_dir.join("resp2chat").join("config.yaml"))
+    Ok(config_dir.join("llmconduit").join("config.yaml"))
 }
 
 pub fn load_default_persisted_config() -> Result<PersistedConfig, String> {
@@ -266,17 +303,17 @@ pub fn write_persisted_config(path: &Path, config: &PersistedConfig) -> Result<(
 }
 
 fn apply_env_overrides(config: &mut PersistedConfig) {
-    if let Ok(value) = env::var("RESP2CHAT_BIND_ADDR")
+    if let Ok(value) = env::var("LLMCONDUIT_BIND_ADDR")
         && !value.trim().is_empty()
     {
         config.bind_addr = value;
     }
-    if let Ok(value) = env::var("RESP2CHAT_UPSTREAM_BASE_URL")
+    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_BASE_URL")
         && !value.trim().is_empty()
     {
         config.upstream_base_url = value;
     }
-    if let Ok(value) = env::var("RESP2CHAT_UPSTREAM_API_KEY")
+    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_API_KEY")
         && !value.trim().is_empty()
     {
         config.upstream_api_key = Some(value);
@@ -286,23 +323,23 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.upstream_api_key = Some(value);
     }
-    if let Ok(value) = env::var("RESP2CHAT_UPSTREAM_MODEL")
+    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_MODEL")
         && !value.trim().is_empty()
     {
         config.upstream_model = Some(value);
     }
-    if let Ok(value) = env::var("RESP2CHAT_UPSTREAM_REQUEST_LOG_PATH")
+    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_REQUEST_LOG_PATH")
         && !value.trim().is_empty()
     {
         config.upstream_request_log_path = Some(value);
     }
-    if let Ok(value) = env::var("RESP2CHAT_UPSTREAM_CHAT_KWARGS_JSON")
+    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON")
         && !value.trim().is_empty()
         && let Ok(parsed) = serde_json::from_str::<JsonMap<String, JsonValue>>(&value)
     {
         config.upstream_chat_kwargs = parsed;
     }
-    if let Ok(value) = env::var("RESP2CHAT_BRAVE_BASE_URL")
+    if let Ok(value) = env::var("LLMCONDUIT_BRAVE_BASE_URL")
         && !value.trim().is_empty()
     {
         config.brave_base_url = value;
@@ -312,32 +349,32 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.brave_api_key = Some(value);
     }
-    if let Ok(value) = env::var("RESP2CHAT_BRAVE_MAX_RESULTS")
+    if let Ok(value) = env::var("LLMCONDUIT_BRAVE_MAX_RESULTS")
         && let Ok(parsed) = value.parse()
     {
         config.brave_max_results = parsed;
     }
-    if let Ok(value) = env::var("RESP2CHAT_REQUEST_TIMEOUT_SECS")
+    if let Ok(value) = env::var("LLMCONDUIT_REQUEST_TIMEOUT_SECS")
         && let Ok(parsed) = value.parse()
     {
         config.request_timeout_secs = parsed;
     }
-    if let Ok(value) = env::var("RESP2CHAT_CONNECT_TIMEOUT_SECS")
+    if let Ok(value) = env::var("LLMCONDUIT_CONNECT_TIMEOUT_SECS")
         && let Ok(parsed) = value.parse()
     {
         config.connect_timeout_secs = parsed;
     }
-    if let Ok(value) = env::var("RESP2CHAT_MAX_WEB_SEARCH_ROUNDS")
+    if let Ok(value) = env::var("LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS")
         && let Ok(parsed) = value.parse()
     {
         config.max_web_search_rounds = parsed;
     }
-    if let Ok(value) = env::var("RESP2CHAT_FLATTEN_CONTENT")
+    if let Ok(value) = env::var("LLMCONDUIT_FLATTEN_CONTENT")
         && let Ok(parsed) = value.parse()
     {
         config.flatten_content = parsed;
     }
-    if let Ok(value) = env::var("RESP2CHAT_MAX_REPLAY_ENTRIES")
+    if let Ok(value) = env::var("LLMCONDUIT_MAX_REPLAY_ENTRIES")
         && let Ok(parsed) = value.parse()
     {
         config.max_replay_entries = parsed;
@@ -368,6 +405,7 @@ mod tests {
     use super::PersistedConfig;
     use super::PersistedModelProfile;
     use super::apply_env_overrides;
+    use super::default_config_path;
     use super::load_persisted_config;
     use super::merge_json_maps;
     use super::write_persisted_config;
@@ -377,6 +415,29 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn default_config_path_uses_llmconduit_config_dir() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config_home = std::env::temp_dir().join(format!(
+            "llmconduit-xdg-config-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+
+        let path = default_config_path().expect("default config path");
+        assert_eq!(path, config_home.join("llmconduit").join("config.yaml"));
+
+        unsafe {
+            match previous_xdg_config_home {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
 
     #[test]
     fn from_persisted_invalid_base_url() {
@@ -407,7 +468,7 @@ mod tests {
     #[test]
     fn load_persisted_config_missing_file_returns_default() {
         let result = load_persisted_config(std::path::Path::new(
-            "/tmp/nonexistent-resp2chat-config-test.yaml",
+            "/tmp/nonexistent-llmconduit-config-test.yaml",
         ));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), PersistedConfig::default());
@@ -418,14 +479,14 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::remove_var("OPENAI_API_KEY");
-            std::env::remove_var("RESP2CHAT_UPSTREAM_API_KEY");
-            std::env::set_var("RESP2CHAT_UPSTREAM_API_KEY", "test-key-12345");
+            std::env::remove_var("LLMCONDUIT_UPSTREAM_API_KEY");
+            std::env::set_var("LLMCONDUIT_UPSTREAM_API_KEY", "test-key-12345");
         }
         let mut config = PersistedConfig::default();
         apply_env_overrides(&mut config);
         assert_eq!(config.upstream_api_key, Some("test-key-12345".to_string()));
         unsafe {
-            std::env::remove_var("RESP2CHAT_UPSTREAM_API_KEY");
+            std::env::remove_var("LLMCONDUIT_UPSTREAM_API_KEY");
             std::env::remove_var("OPENAI_API_KEY");
         };
     }
@@ -434,7 +495,7 @@ mod tests {
     fn apply_env_overrides_openai_fallback() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
-            std::env::remove_var("RESP2CHAT_UPSTREAM_API_KEY");
+            std::env::remove_var("LLMCONDUIT_UPSTREAM_API_KEY");
             std::env::remove_var("OPENAI_API_KEY");
             std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
         }
@@ -446,7 +507,7 @@ mod tests {
             Some("fallback-key-67890".to_string())
         );
         unsafe {
-            std::env::remove_var("RESP2CHAT_UPSTREAM_API_KEY");
+            std::env::remove_var("LLMCONDUIT_UPSTREAM_API_KEY");
             std::env::remove_var("OPENAI_API_KEY");
         };
     }
@@ -454,7 +515,7 @@ mod tests {
     #[test]
     fn persisted_config_roundtrips() {
         let path = std::env::temp_dir().join(format!(
-            "resp2chat-config-{}.yaml",
+            "llmconduit-config-{}.yaml",
             uuid::Uuid::new_v4().simple()
         ));
         let config = PersistedConfig {
@@ -462,7 +523,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: Some("upstream-secret".to_string()),
             upstream_model: Some("grok-4".to_string()),
-            upstream_request_log_path: Some("/tmp/resp2chat-upstream.jsonl".to_string()),
+            upstream_request_log_path: Some("/tmp/llmconduit-upstream.jsonl".to_string()),
             upstream_chat_kwargs: JsonMap::from_iter([(
                 "clear_thinking".to_string(),
                 JsonValue::Bool(false),
@@ -471,6 +532,7 @@ mod tests {
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     upstream_model: None,
+                    system_prompt_prefix: Some("Use Kimi-compatible behavior.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
                         json!({
@@ -508,6 +570,7 @@ mod tests {
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     upstream_model: None,
+                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
                         json!({
@@ -557,6 +620,7 @@ mod tests {
                 "MiMo-V2.5".to_string(),
                 PersistedModelProfile {
                     upstream_model: Some("mimo-v2.5".to_string()),
+                    system_prompt_prefix: Some("Prefer concise answers.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
                         ("separate_reasoning".to_string(), JsonValue::Bool(true)),
                         (
@@ -597,6 +661,127 @@ mod tests {
     }
 
     #[test]
+    fn resolves_upstream_model_profile_after_global_model_remap() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: BTreeMap::from_iter([(
+                "xiaomi/mimo-v2.5-pro".to_string(),
+                PersistedModelProfile {
+                    upstream_model: None,
+                    system_prompt_prefix: Some("Use MiMo-compatible behavior.".to_string()),
+                    upstream_chat_kwargs: JsonMap::from_iter([(
+                        "reasoning".to_string(),
+                        json!({
+                            "enabled": true
+                        }),
+                    )]),
+                },
+            )]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        assert_eq!(
+            config.resolve_upstream_model("client-default-model"),
+            "xiaomi/mimo-v2.5-pro"
+        );
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("client-default-model"),
+            JsonMap::from_iter([(
+                "reasoning".to_string(),
+                json!({
+                    "enabled": true
+                }),
+            )])
+        );
+        assert_eq!(
+            config
+                .resolve_system_prompt_prefix("client-default-model")
+                .as_deref(),
+            Some("Use MiMo-compatible behavior.")
+        );
+    }
+
+    #[test]
+    fn request_model_profile_overrides_upstream_model_profile_kwargs() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: BTreeMap::from_iter([
+                (
+                    "xiaomi/mimo-v2.5-pro".to_string(),
+                    PersistedModelProfile {
+                        upstream_model: None,
+                        system_prompt_prefix: Some("Backend prefix.".to_string()),
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "reasoning".to_string(),
+                            json!({
+                                "enabled": true,
+                                "effort": "medium"
+                            }),
+                        )]),
+                    },
+                ),
+                (
+                    "client-default-model".to_string(),
+                    PersistedModelProfile {
+                        upstream_model: None,
+                        system_prompt_prefix: Some("Client prefix.".to_string()),
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "reasoning".to_string(),
+                            json!({
+                                "effort": "high"
+                            }),
+                        )]),
+                    },
+                ),
+            ]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("client-default-model"),
+            JsonMap::from_iter([(
+                "reasoning".to_string(),
+                json!({
+                    "enabled": true,
+                    "effort": "high"
+                }),
+            )])
+        );
+        assert_eq!(
+            config
+                .resolve_system_prompt_prefix("client-default-model")
+                .as_deref(),
+            Some("Client prefix.")
+        );
+    }
+
+    #[test]
     fn resolves_exact_model_profile_before_case_insensitive_fallback() {
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
@@ -610,6 +795,7 @@ mod tests {
                     "MiMo-V2.5".to_string(),
                     PersistedModelProfile {
                         upstream_model: Some("upper-profile".to_string()),
+                        system_prompt_prefix: Some("Upper prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(true),
@@ -620,6 +806,7 @@ mod tests {
                     "mimo-v2.5".to_string(),
                     PersistedModelProfile {
                         upstream_model: Some("lower-profile".to_string()),
+                        system_prompt_prefix: Some("Lower prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(false),
@@ -642,6 +829,10 @@ mod tests {
         assert_eq!(
             config.resolve_upstream_chat_kwargs("mimo-v2.5"),
             JsonMap::from_iter([("stream_reasoning".to_string(), JsonValue::Bool(false))])
+        );
+        assert_eq!(
+            config.resolve_system_prompt_prefix("mimo-v2.5").as_deref(),
+            Some("Lower prefix.")
         );
     }
 
@@ -698,7 +889,7 @@ mod tests {
     fn config_file_has_restricted_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!(
-            "resp2chat-perms-{}.yaml",
+            "llmconduit-perms-{}.yaml",
             uuid::Uuid::new_v4().simple()
         ));
         let config = PersistedConfig::default();

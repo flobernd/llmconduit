@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>llmconduit debug</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101214;
+      --panel: #171a1f;
+      --panel-2: #1f242a;
+      --line: #303741;
+      --text: #edf1f5;
+      --muted: #9aa6b2;
+      --blue: #6bb6ff;
+      --green: #58d68d;
+      --amber: #f6c453;
+      --red: #ff6b6b;
+      --tool: #87d4d8;
+      --reasoning: #87909b;
+      --shadow: rgba(0, 0, 0, 0.24);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    button, input {
+      font: inherit;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: minmax(280px, 34vw) minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .topbar {
+      min-height: 56px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 14px;
+    }
+
+    .brand {
+      font-weight: 650;
+      font-size: 15px;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+
+    .socket {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 0;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--amber);
+      flex: none;
+    }
+
+    .dot.open { background: var(--green); }
+    .dot.closed { background: var(--red); }
+
+    .request-list {
+      overflow: auto;
+      min-height: 0;
+      padding: 8px;
+    }
+
+    .request-button {
+      width: 100%;
+      display: block;
+      text-align: left;
+      background: transparent;
+      color: var(--text);
+      border: 1px solid transparent;
+      border-radius: 7px;
+      padding: 10px;
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    .request-button:hover {
+      background: var(--panel-2);
+    }
+
+    .request-button.selected {
+      border-color: #4e9de6;
+      background: #1b2835;
+    }
+
+    .request-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .request-id, .model, .summary-line, .metric {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .request-id {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--text);
+      font-size: 12px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-size: 11px;
+      line-height: 16px;
+      color: var(--muted);
+      flex: none;
+    }
+
+    .badge.running { color: var(--amber); border-color: rgba(246, 196, 83, 0.45); }
+    .badge.completed { color: var(--green); border-color: rgba(88, 214, 141, 0.45); }
+    .badge.failed { color: var(--red); border-color: rgba(255, 107, 107, 0.45); }
+
+    .model {
+      margin-top: 7px;
+      color: var(--blue);
+      font-size: 13px;
+    }
+
+    .metrics {
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .metric {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .content {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: #111417;
+    }
+
+    .detail-head {
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px 16px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .title {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 14px;
+    }
+
+    .summary-line {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 4px;
+      padding-top: 2px;
+      overflow-x: auto;
+    }
+
+    .tab {
+      color: var(--muted);
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 6px 10px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .tab.active {
+      color: var(--text);
+      border-color: var(--line);
+      background: var(--panel-2);
+    }
+
+    .pane {
+      overflow: auto;
+      min-height: 0;
+      flex: 1;
+      padding: 14px 16px 32px;
+    }
+
+    .empty {
+      color: var(--muted);
+      display: grid;
+      place-items: center;
+      min-height: 50vh;
+      font-size: 14px;
+    }
+
+    .segment {
+      margin: 0 0 10px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .segment.reasoning { color: var(--reasoning); }
+    .segment.tool { color: var(--tool); }
+
+    .payload {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #dfe7ef;
+      background: #0d0f12;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 12px;
+      box-shadow: 0 12px 24px var(--shadow);
+    }
+
+    .image-list {
+      display: grid;
+      gap: 10px;
+      margin: 10px 0;
+    }
+
+    .event-image {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #0d0f12;
+      padding: 10px;
+    }
+
+    .event-image img {
+      display: block;
+      max-width: 100%;
+      max-height: 360px;
+      object-fit: contain;
+      background: #08090a;
+      border-radius: 5px;
+    }
+
+    .image-caption {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .event {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 0;
+    }
+
+    .event summary {
+      cursor: pointer;
+      color: var(--text);
+      list-style: none;
+    }
+
+    .event summary::-webkit-details-marker { display: none; }
+
+    .event-meta {
+      display: flex;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 5px;
+      min-width: 0;
+    }
+
+    .event-kind {
+      color: var(--blue);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .event-summary {
+      color: var(--text);
+      font-size: 13px;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 820px) {
+      .app {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(210px, 42vh) minmax(0, 1fr);
+      }
+
+      .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <aside class="sidebar">
+      <div class="topbar">
+        <div class="brand">llmconduit debug</div>
+        <div class="socket"><span id="socket-dot" class="dot"></span><span id="socket-text">connecting</span></div>
+      </div>
+      <div id="request-list" class="request-list"></div>
+    </aside>
+    <section class="content">
+      <div id="detail-head" class="detail-head"></div>
+      <div id="pane" class="pane empty">Waiting for requests</div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      requests: new Map(),
+      order: [],
+      selectedId: null,
+      tab: "output",
+      connected: false,
+      retentionMs: 30 * 60 * 1000
+    };
+
+    const listEl = document.getElementById("request-list");
+    const headEl = document.getElementById("detail-head");
+    const paneEl = document.getElementById("pane");
+    const dotEl = document.getElementById("socket-dot");
+    const socketTextEl = document.getElementById("socket-text");
+
+    function connect() {
+      const scheme = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${scheme}://${location.host}/debug/ws`);
+
+      ws.addEventListener("open", () => setSocket(true, "live"));
+      ws.addEventListener("message", event => applyMessage(JSON.parse(event.data)));
+      ws.addEventListener("close", () => {
+        setSocket(false, "closed");
+        setTimeout(connect, 1000);
+      });
+      ws.addEventListener("error", () => setSocket(false, "error"));
+    }
+
+    function setSocket(open, label) {
+      state.connected = open;
+      dotEl.className = `dot ${open ? "open" : "closed"}`;
+      socketTextEl.textContent = label;
+    }
+
+    function ensureRequest(id) {
+      if (!state.requests.has(id)) {
+        state.requests.set(id, {
+          response_id: id,
+          model: "",
+          status: "running",
+          stats: {},
+          segments: [],
+          events: []
+        });
+        state.order.unshift(id);
+      }
+      return state.requests.get(id);
+    }
+
+    function applyMessage(message) {
+      if (message.type === "hello") {
+        if (message.history_retention_ms) {
+          state.retentionMs = Number(message.history_retention_ms);
+        }
+        state.requests.clear();
+        state.order = [];
+        state.selectedId = null;
+        render();
+        return;
+      }
+      if (message.type === "snapshot_done") {
+        render();
+        return;
+      }
+      if (message.type === "request_upsert") {
+        const id = message.request.response_id;
+        const exists = state.requests.has(id);
+        const current = ensureRequest(id);
+        Object.assign(current, message.request);
+        current.segments = current.segments || [];
+        current.events = current.events || [];
+        if (!exists) moveToFront(id);
+        if (!state.selectedId) state.selectedId = id;
+        render();
+        return;
+      }
+      if (message.type === "request_remove") {
+        removeRequest(message.response_id);
+        render();
+        return;
+      }
+      if (message.type === "segment_append") {
+        const request = ensureRequest(message.response_id);
+        request.updated_at_ms = message.segment.timestamp_ms || Date.now();
+        const last = request.segments[request.segments.length - 1];
+        if (last && last.kind === message.segment.kind) {
+          last.text += message.segment.text;
+          last.timestamp_ms = message.segment.timestamp_ms;
+        } else {
+          request.segments.push(message.segment);
+        }
+        if (!state.selectedId) state.selectedId = message.response_id;
+        renderActiveIfSelected(message.response_id);
+        return;
+      }
+      if (message.type === "event_append") {
+        const request = ensureRequest(message.response_id);
+        request.updated_at_ms = message.event.timestamp_ms || Date.now();
+        request.events.push(message.event);
+        if (!state.selectedId) state.selectedId = message.response_id;
+        renderActiveIfSelected(message.response_id);
+        return;
+      }
+      if (message.type === "request_status") {
+        const request = ensureRequest(message.response_id);
+        request.status = message.status;
+        request.completed_at_ms = message.completed_at_ms;
+        request.updated_at_ms = message.completed_at_ms || Date.now();
+        request.error = message.error;
+        renderList();
+        renderActiveIfSelected(message.response_id);
+      }
+    }
+
+    function moveToFront(id) {
+      state.order = state.order.filter(item => item !== id);
+      state.order.unshift(id);
+    }
+
+    function selectRequest(id) {
+      if (!state.requests.has(id) || state.selectedId === id) return;
+      state.selectedId = id;
+      render();
+    }
+
+    function removeRequest(id) {
+      state.requests.delete(id);
+      state.order = state.order.filter(item => item !== id);
+      if (state.selectedId === id) {
+        state.selectedId = state.order[0] || null;
+      }
+    }
+
+    function pruneExpiredRequests() {
+      const cutoff = Date.now() - state.retentionMs;
+      let changed = false;
+      for (const id of [...state.order]) {
+        const request = state.requests.get(id);
+        const lastUpdate = Number(request?.updated_at_ms || request?.completed_at_ms || request?.started_at_ms || 0);
+        if (lastUpdate && lastUpdate < cutoff) {
+          removeRequest(id);
+          changed = true;
+        }
+      }
+      return changed;
+    }
+
+    function render() {
+      renderList();
+      renderActive();
+    }
+
+    function renderList() {
+      listEl.replaceChildren();
+      for (const id of state.order) {
+        const request = state.requests.get(id);
+        const button = document.createElement("button");
+        button.className = `request-button ${id === state.selectedId ? "selected" : ""}`;
+        button.type = "button";
+        button.addEventListener("pointerdown", event => {
+          if (event.button !== 0) return;
+          event.preventDefault();
+          selectRequest(id);
+        });
+        button.addEventListener("click", () => selectRequest(id));
+        button.innerHTML = `
+          <div class="request-head">
+            <span class="request-id">${escapeHtml(shortId(id))}</span>
+            <span class="badge ${escapeHtml(request.status || "running")}">${escapeHtml(request.status || "running")}</span>
+          </div>
+          <div class="model">${escapeHtml(request.model || "unknown model")}</div>
+          <div class="metrics">
+            <div class="metric">${formatCount(request.stats?.input_items)} items</div>
+            <div class="metric">${formatCount(request.stats?.tool_count)} tools</div>
+            <div class="metric">${formatCount(request.stats?.input_chars)} chars</div>
+            <div class="metric">${formatTime(request.started_at_ms)}</div>
+            <div class="metric">${formatDuration(request)}</div>
+            <div class="metric">${formatCount(request.events?.length)} events</div>
+          </div>
+        `;
+        listEl.appendChild(button);
+      }
+    }
+
+    function renderActive() {
+      const request = state.selectedId ? state.requests.get(state.selectedId) : null;
+      if (!request) {
+        headEl.replaceChildren();
+        paneEl.className = "pane empty";
+        paneEl.textContent = "Waiting for requests";
+        return;
+      }
+
+      headEl.innerHTML = `
+        <div class="title-row">
+          <div class="title">${escapeHtml(request.response_id)}</div>
+          <span class="badge ${escapeHtml(request.status || "running")}">${escapeHtml(request.status || "running")}</span>
+        </div>
+        <div class="summary-line">${escapeHtml(request.model || "unknown model")} | ${formatTime(request.started_at_ms)} | ${formatDuration(request)}</div>
+        <div class="tabs">
+          ${tabButton("output", "Output")}
+          ${tabButton("prompt", "Prompt")}
+          ${tabButton("upstream", "Upstream")}
+          ${tabButton("events", "Events")}
+        </div>
+      `;
+      for (const button of headEl.querySelectorAll(".tab")) {
+        button.addEventListener("click", () => {
+          state.tab = button.dataset.tab;
+          renderActive();
+        });
+      }
+
+      paneEl.className = "pane";
+      if (state.tab === "output") renderOutput(request);
+      if (state.tab === "prompt") renderPrompt(request);
+      if (state.tab === "upstream") renderUpstream(request);
+      if (state.tab === "events") renderEvents(request);
+    }
+
+    function tabButton(id, label) {
+      return `<button type="button" class="tab ${state.tab === id ? "active" : ""}" data-tab="${id}">${label}</button>`;
+    }
+
+    function renderOutput(request) {
+      paneEl.replaceChildren();
+      if (!request.segments?.length) {
+        paneEl.className = "pane empty";
+        paneEl.textContent = "No output yet";
+        return;
+      }
+      for (const segment of request.segments) {
+        const pre = document.createElement("pre");
+        pre.className = `segment ${segment.kind || "output"}`;
+        pre.textContent = segment.text;
+        paneEl.appendChild(pre);
+      }
+      paneEl.scrollTop = paneEl.scrollHeight;
+    }
+
+    function renderPayload(request, kind) {
+      const event = [...(request.events || [])].reverse().find(item => item.kind === kind && hasEventDetail(item));
+      paneEl.replaceChildren();
+      if (!event) {
+        paneEl.className = "pane empty";
+        paneEl.textContent = "No payload";
+        return;
+      }
+      appendEventImages(paneEl, event);
+      appendEventPayload(paneEl, event);
+    }
+
+    function renderPrompt(request) {
+      const events = [...(request.events || [])].reverse();
+      const event = events.find(item => item.kind === "upstream_request" && hasEventDetail(item))
+        || events.find(item => item.kind === "request_payload" && hasEventDetail(item));
+      paneEl.replaceChildren();
+      if (!event) {
+        paneEl.className = "pane empty";
+        paneEl.textContent = "No prompt";
+        return;
+      }
+      appendEventImages(paneEl, event);
+      appendEventPayload(paneEl, event);
+    }
+
+    function renderUpstream(request) {
+      const events = (request.events || []).filter(item => item.kind === "upstream_request");
+      paneEl.replaceChildren();
+      if (!events.length) {
+        paneEl.className = "pane empty";
+        paneEl.textContent = "No upstream requests";
+        return;
+      }
+      for (const event of events) {
+        const details = document.createElement("details");
+        details.className = "event";
+        details.open = events.length === 1;
+        details.innerHTML = `
+          <summary>
+            <div class="event-meta"><span>${formatTime(event.timestamp_ms)}</span><span class="event-kind">${escapeHtml(event.kind)}</span></div>
+            <div class="event-summary">${escapeHtml(event.summary)}</div>
+          </summary>
+        `;
+        appendEventImages(details, event);
+        appendEventPayload(details, event);
+        paneEl.appendChild(details);
+      }
+    }
+
+    function renderEvents(request) {
+      paneEl.replaceChildren();
+      if (!request.events?.length) {
+        paneEl.className = "pane empty";
+        paneEl.textContent = "No events";
+        return;
+      }
+      for (const event of request.events) {
+        const details = document.createElement("details");
+        details.className = "event";
+        details.innerHTML = `
+          <summary>
+            <div class="event-meta"><span>${formatTime(event.timestamp_ms)}</span><span class="event-kind">${escapeHtml(event.kind)}</span></div>
+            <div class="event-summary">${escapeHtml(event.summary || "")}</div>
+          </summary>
+        `;
+        appendEventImages(details, event);
+        appendEventPayload(details, event);
+        paneEl.appendChild(details);
+      }
+    }
+
+    function hasEventDetail(event) {
+      return Boolean(event.payload_preview || event.images?.length);
+    }
+
+    function appendEventPayload(parent, event) {
+      if (!event.payload_preview) return;
+      const pre = document.createElement("pre");
+      pre.className = "payload";
+      pre.textContent = event.payload_preview;
+      parent.appendChild(pre);
+    }
+
+    function appendEventImages(parent, event) {
+      if (!event.images?.length) return;
+      const list = document.createElement("div");
+      list.className = "image-list";
+      for (const image of event.images) {
+        const item = document.createElement("figure");
+        item.className = "event-image";
+        const img = document.createElement("img");
+        img.src = image.src;
+        img.alt = image.label || image.path || "input image";
+        img.loading = "lazy";
+        item.appendChild(img);
+
+        const caption = document.createElement("figcaption");
+        caption.className = "image-caption";
+        caption.textContent = `${image.label || "image"} | ${image.mime_type || "image"} | ${formatBytes(image.size_bytes)} | ${image.path || ""}`;
+        item.appendChild(caption);
+        list.appendChild(item);
+      }
+      parent.appendChild(list);
+    }
+
+    function renderActiveIfSelected(id) {
+      if (state.selectedId === id) renderActive();
+    }
+
+    function formatCount(value) {
+      return Number(value || 0).toLocaleString();
+    }
+
+    function formatTime(ms) {
+      if (!ms) return "";
+      return new Date(Number(ms)).toLocaleTimeString();
+    }
+
+    function formatDuration(request) {
+      const start = Number(request.started_at_ms || 0);
+      if (!start) return "";
+      const end = Number(request.completed_at_ms || Date.now());
+      const seconds = Math.max(0, (end - start) / 1000);
+      if (seconds < 10) return `${seconds.toFixed(1)}s`;
+      return `${Math.round(seconds)}s`;
+    }
+
+    function formatBytes(value) {
+      const bytes = Number(value || 0);
+      if (!bytes) return "unknown size";
+      if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+      if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+      return `${bytes} B`;
+    }
+
+    function shortId(id) {
+      return id && id.length > 22 ? `${id.slice(0, 22)}...` : id;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll("\"", "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    setInterval(() => {
+      if (pruneExpiredRequests()) {
+        render();
+      } else {
+        renderList();
+      }
+    }, 1000);
+    connect();
+  </script>
+</body>
+</html>

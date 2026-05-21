@@ -14,11 +14,14 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "resp2chat",
+    name = "llmconduit",
     version,
-    about = "Responses-to-chat gateway for Codex-style local model development"
+    about = "LLM API gateway for translating, normalizing, and extending model traffic"
 )]
 pub struct Cli {
+    /// Enable the embedded request debug UI at /debug.
+    #[arg(long, global = true, default_value_t = false)]
+    pub with_debug_ui: bool,
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -27,25 +30,22 @@ pub struct Cli {
 pub enum Commands {
     /// Start the gateway server.
     Start {
-        /// Path to the config file. Defaults to ~/.config/resp2chat/config.yaml
+        /// Path to the config file. Defaults to ~/.config/llmconduit/config.yaml
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Show live request text panes while the gateway is running.
-        #[arg(long, default_value_t = false, conflicts_with = "raw")]
-        ui: bool,
         /// Dump raw model delta text to the terminal while the gateway is running.
-        #[arg(long, default_value_t = false, conflicts_with = "ui")]
+        #[arg(long, default_value_t = false)]
         raw: bool,
     },
     /// Run the interactive configuration flow and write a config file.
     Configure {
-        /// Path to the config file. Defaults to ~/.config/resp2chat/config.yaml
+        /// Path to the config file. Defaults to ~/.config/llmconduit/config.yaml
         #[arg(long)]
         config: Option<PathBuf>,
     },
     /// Diff consecutive upstream request log entries and highlight unstable prefixes.
     AnalyzeLog {
-        /// Path to the config file. Defaults to ~/.config/resp2chat/config.yaml
+        /// Path to the config file. Defaults to ~/.config/llmconduit/config.yaml
         #[arg(long)]
         config: Option<PathBuf>,
         /// Path to the JSONL request log. Defaults to upstream_request_log_path from config.
@@ -65,7 +65,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
     let existing = load_persisted_config(&path)?;
     let theme = ColorfulTheme::default();
 
-    println!("Configuring resp2chat");
+    println!("Configuring llmconduit");
     println!("Config file: {}", path.display());
 
     let bind_addr = Input::with_theme(&theme)

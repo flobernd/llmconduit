@@ -195,9 +195,7 @@ fn convert_message(
                         }
                     }
                     AnthropicContentBlock::Image { source } => {
-                        content_items.push(ContentItem::InputImage {
-                            image_url: image_source_to_url(source)?,
-                        });
+                        content_items.push(image_source_to_content_item(source)?);
                     }
                     _ => {}
                 }
@@ -348,7 +346,7 @@ fn text_message_item(role: &str, text: &str) -> ResponseItem {
     }
 }
 
-fn image_source_to_url(source: &AnthropicImageSource) -> AppResult<String> {
+fn image_source_to_content_item(source: &AnthropicImageSource) -> AppResult<ContentItem> {
     match source.kind.as_str() {
         "base64" => {
             let media_type = source.media_type.as_deref().unwrap_or("image/png");
@@ -359,17 +357,38 @@ fn image_source_to_url(source: &AnthropicImageSource) -> AppResult<String> {
                 .ok_or_else(|| {
                     AppError::bad_request("Anthropic base64 image source is missing data")
                 })?;
-            Ok(format!("data:{media_type};base64,{data}"))
+            Ok(ContentItem::InputImage {
+                image_url: Some(format!("data:{media_type};base64,{data}")),
+                file_id: None,
+                detail: None,
+            })
         }
-        "url" => source
-            .url
-            .clone()
-            .filter(|url| !url.is_empty())
-            .ok_or_else(|| AppError::bad_request("Anthropic image source is missing url")),
-        "file" => Err(AppError::bad_request(format!(
-            "Anthropic image source type \"file\" is not supported by this gateway (file_id={})",
-            source.file_id.as_deref().unwrap_or("unknown")
-        ))),
+        "url" => {
+            let image_url = source
+                .url
+                .clone()
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| AppError::bad_request("Anthropic image source is missing url"))?;
+            Ok(ContentItem::InputImage {
+                image_url: Some(image_url),
+                file_id: None,
+                detail: None,
+            })
+        }
+        "file" => {
+            let file_id = source
+                .file_id
+                .clone()
+                .filter(|file_id| !file_id.is_empty())
+                .ok_or_else(|| {
+                    AppError::bad_request("Anthropic file image source is missing file_id")
+                })?;
+            Ok(ContentItem::InputImage {
+                image_url: None,
+                file_id: Some(file_id),
+                detail: None,
+            })
+        }
         other => Err(AppError::bad_request(format!(
             "unsupported Anthropic image source type \"{other}\""
         ))),
@@ -782,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_base64_image_to_data_url() {
+    fn converts_base64_image_to_input_image() {
         let source = AnthropicImageSource {
             kind: "base64".to_string(),
             media_type: Some("image/png".to_string()),
@@ -790,10 +809,15 @@ mod tests {
             url: None,
             file_id: None,
         };
-        assert_eq!(
-            image_source_to_url(&source).expect("image url"),
-            "data:image/png;base64,iVBORw0KGgo="
-        );
+        let item = image_source_to_content_item(&source).expect("image item");
+        assert!(matches!(
+            item,
+            ContentItem::InputImage {
+                image_url: Some(ref image_url),
+                file_id: None,
+                ..
+            } if image_url == "data:image/png;base64,iVBORw0KGgo="
+        ));
     }
 
     #[test]
@@ -805,14 +829,19 @@ mod tests {
             url: Some("https://example.com/img.png".to_string()),
             file_id: None,
         };
-        assert_eq!(
-            image_source_to_url(&source).expect("image url"),
-            "https://example.com/img.png"
-        );
+        let item = image_source_to_content_item(&source).expect("image item");
+        assert!(matches!(
+            item,
+            ContentItem::InputImage {
+                image_url: Some(ref image_url),
+                file_id: None,
+                ..
+            } if image_url == "https://example.com/img.png"
+        ));
     }
 
     #[test]
-    fn rejects_unsupported_file_image_source() {
+    fn converts_file_image_source_to_file_id() {
         let source = AnthropicImageSource {
             kind: "file".to_string(),
             media_type: None,
@@ -820,6 +849,14 @@ mod tests {
             url: None,
             file_id: Some("file_123".to_string()),
         };
-        assert!(image_source_to_url(&source).is_err());
+        let item = image_source_to_content_item(&source).expect("image item");
+        assert!(matches!(
+            item,
+            ContentItem::InputImage {
+                image_url: None,
+                file_id: Some(ref file_id),
+                ..
+            } if file_id == "file_123"
+        ));
     }
 }

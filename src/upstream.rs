@@ -230,20 +230,58 @@ async fn ensure_success(
         .filter_map(|result| async move {
             match result {
                 Ok(event) if event.data == "[DONE]" => None,
-                Ok(event) => Some(
-                    serde_json::from_str::<ChatCompletionChunk>(&event.data).map_err(|err| {
-                        AppError::upstream(format!(
-                            "failed to parse upstream chat chunk: {err}; payload={}",
-                            truncate_for_error(&event.data, 500)
-                        ))
-                    }),
-                ),
+                Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
+                    AppError::upstream(format!(
+                        "failed to parse upstream chat chunk: {err}; payload={}",
+                        truncate_for_error(&event.data, 500)
+                    ))
+                })),
                 Err(err) => Some(Err(AppError::upstream(format!(
                     "failed to read upstream SSE: {err}"
                 )))),
             }
         });
     Ok(Box::pin(stream))
+}
+
+fn parse_chat_completion_chunk(data: &str) -> Result<ChatCompletionChunk, serde_json::Error> {
+    let first_error = match serde_json::from_str::<ChatCompletionChunk>(data) {
+        Ok(chunk) => return Ok(chunk),
+        Err(err) => err,
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+        return Err(first_error);
+    };
+    if !normalize_sparse_tool_call_types(&mut value) {
+        return Err(first_error);
+    }
+    serde_json::from_value(value)
+}
+
+fn normalize_sparse_tool_call_types(value: &mut Value) -> bool {
+    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for choice in choices {
+        let Some(tool_calls) = choice
+            .get_mut("delta")
+            .and_then(|delta| delta.get_mut("tool_calls"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for tool_call in tool_calls {
+            let Some(object) = tool_call.as_object_mut() else {
+                continue;
+            };
+            if !object.contains_key("type") {
+                object.insert("type".to_string(), Value::String("function".to_string()));
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 pub async fn collect_models_response(
@@ -293,7 +331,7 @@ fn extract_model_ids_from_array(entries: &[Value]) -> Vec<String> {
         .collect()
 }
 
-fn sanitize_chat_request(
+pub(crate) fn sanitize_chat_request(
     mut request: ChatCompletionRequest,
     flatten_content: bool,
 ) -> ChatCompletionRequest {
@@ -322,7 +360,7 @@ fn sanitize_message_content(content: Value, flatten_content: bool) -> Option<Val
         Value::Null => None,
         Value::String(text) => Some(Value::String(text)),
         Value::Array(parts) => {
-            if flatten_content {
+            if flatten_content && content_parts_are_text_only(&parts) {
                 Some(Value::String(flatten_content_parts(&parts)))
             } else {
                 Some(Value::Array(parts))
@@ -330,6 +368,17 @@ fn sanitize_message_content(content: Value, flatten_content: bool) -> Option<Val
         }
         other => Some(stringify_json_value(other)),
     }
+}
+
+fn content_parts_are_text_only(parts: &[Value]) -> bool {
+    parts.iter().all(|part| {
+        let has_text = part.get("text").and_then(Value::as_str).is_some();
+        let text_kind = matches!(
+            part.get("type").and_then(Value::as_str),
+            None | Some("text") | Some("input_text") | Some("output_text")
+        );
+        has_text && text_kind
+    })
 }
 
 fn flatten_content_parts(parts: &[Value]) -> String {
@@ -401,6 +450,80 @@ mod tests {
         assert_eq!(
             client.endpoint_url("models").expect("endpoint").as_str(),
             "https://api.x.ai/v1/models"
+        );
+    }
+
+    #[test]
+    fn normalize_sparse_tool_call_types_fills_chat_function_type() {
+        let mut value = serde_json::json!({
+            "id": "gen-1778509925-7119UkUjPTix9sGQ4vZf",
+            "object": "chat.completion.chunk",
+            "created": 1778509925,
+            "model": "xiaomi/mimo-v2.5-pro-20260422",
+            "provider": "Xiaomi",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": null,
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": "{\"file_path\": \"/home/luke/.claude/projects/-home-luke-projects-demo/memory/smb_clone.md\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null,
+                "native_finish_reason": null
+            }]
+        });
+
+        assert!(super::normalize_sparse_tool_call_types(&mut value));
+        assert_eq!(
+            value["choices"][0]["delta"]["tool_calls"][0]["type"],
+            Value::String("function".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_chat_completion_chunk_accepts_openrouter_sparse_tool_call() {
+        let payload = serde_json::json!({
+            "id": "gen-1778509925-7119UkUjPTix9sGQ4vZf",
+            "object": "chat.completion.chunk",
+            "created": 1778509925,
+            "model": "xiaomi/mimo-v2.5-pro-20260422",
+            "provider": "Xiaomi",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": null,
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": "{\"file_path\": \"/home/luke/.claude/projects/-home-luke-projects-demo/memory/smb_clone.md\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null,
+                "native_finish_reason": null
+            }]
+        })
+        .to_string();
+
+        let chunk = super::parse_chat_completion_chunk(&payload).expect("parse chunk");
+        let tool_call = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call.kind, "function");
+        assert_eq!(tool_call.index, Some(0));
+        assert_eq!(
+            tool_call
+                .function
+                .arguments
+                .as_ref()
+                .and_then(Value::as_str),
+            Some(
+                "{\"file_path\": \"/home/luke/.claude/projects/-home-luke-projects-demo/memory/smb_clone.md\"}"
+            )
         );
     }
 
@@ -629,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn upstream_request_logger_writes_jsonl() {
         let path = std::env::temp_dir().join(format!(
-            "resp2chat-upstream-log-{}.jsonl",
+            "llmconduit-upstream-log-{}.jsonl",
             uuid::Uuid::new_v4().simple()
         ));
         let logger = UpstreamRequestLogger::new(path.clone());
@@ -727,6 +850,16 @@ mod tests {
         ]);
         let result = super::sanitize_message_content(array, true);
         assert_eq!(result, Some(Value::String("hello\nworld".to_string())));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_multimodal_array_when_flatten_enabled() {
+        let array = serde_json::json!([
+            { "type": "text", "text": "look" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } }
+        ]);
+        let result = super::sanitize_message_content(array.clone(), true);
+        assert_eq!(result, Some(array));
     }
 
     #[test]

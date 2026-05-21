@@ -391,7 +391,9 @@ fn output_text(content: &[ContentItem]) -> String {
             ContentItem::OutputText { text } | ContentItem::InputText { text } => {
                 Some(text.clone())
             }
-            ContentItem::InputImage { .. } => None,
+            ContentItem::InputImage { .. }
+            | ContentItem::InputFile { .. }
+            | ContentItem::Other(_) => None,
         })
         .collect::<Vec<_>>()
         .join("")

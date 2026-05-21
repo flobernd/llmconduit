@@ -87,6 +87,7 @@ pub struct ChatToolCall {
     pub index: Option<usize>,
     #[serde(rename = "type", default = "default_chat_tool_call_kind")]
     pub kind: String,
+    #[serde(default)]
     pub function: ChatFunctionCall,
 }
 
@@ -94,7 +95,7 @@ fn default_chat_tool_call_kind() -> String {
     "function".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ChatFunctionCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -246,6 +247,72 @@ mod tests {
         assert_eq!(tool_call.kind, "function");
         assert_eq!(tool_call.id.as_deref(), Some("call_1"));
         assert_eq!(tool_call.function.name.as_deref(), Some("echo"));
+    }
+
+    #[test]
+    fn deserializes_openrouter_sparse_tool_call_chunk() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "gen-1778509792-pCb6B8HesSj8dH3qOYxT",
+            "object": "chat.completion.chunk",
+            "created": 1778509792,
+            "model": "xiaomi/mimo-v2.5-pro-20260422",
+            "provider": "Xiaomi",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": null,
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": "{\"file_path\":\"/home/luke/.claude/projects/-home-luke-projects-demo/memory/smb_clone.md\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null,
+                "native_finish_reason": null
+            }]
+        }))
+        .expect("chunk should deserialize");
+
+        let tool_call = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call.kind, "function");
+        assert_eq!(tool_call.index, Some(0));
+        assert_eq!(tool_call.id, None);
+        assert_eq!(tool_call.function.name, None);
+        assert_eq!(
+            tool_call
+                .function
+                .arguments
+                .as_ref()
+                .and_then(Value::as_str),
+            Some(
+                "{\"file_path\":\"/home/luke/.claude/projects/-home-luke-projects-demo/memory/smb_clone.md\"}"
+            )
+        );
+    }
+
+    #[test]
+    fn deserializes_tool_call_chunk_without_function_field() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1"
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("chunk should deserialize");
+
+        let tool_call = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call.kind, "function");
+        assert_eq!(tool_call.id.as_deref(), Some("call_1"));
+        assert_eq!(tool_call.function, ChatFunctionCall::default());
     }
 
     #[test]

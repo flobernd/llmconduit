@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn request_log_single_entry() {
         let path = std::env::temp_dir().join(format!(
-            "resp2chat-single-entry-{}.jsonl",
+            "llmconduit-single-entry-{}.jsonl",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::write(&path, "{\"model\":\"test\",\"messages\":[]}\n").expect("write");
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn analyze_request_log_reports_pair_details() {
         let path = std::env::temp_dir().join(format!(
-            "resp2chat-request-log-{}.jsonl",
+            "llmconduit-request-log-{}.jsonl",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::write(
