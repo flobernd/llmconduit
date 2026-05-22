@@ -360,7 +360,10 @@ impl Gateway {
         Ok(ReceiverStream::new(rx))
     }
 
-    fn apply_system_prompt_prefix(&self, mut request: ResponsesRequest) -> ResponsesRequest {
+    pub(crate) fn apply_system_prompt_prefix(
+        &self,
+        mut request: ResponsesRequest,
+    ) -> ResponsesRequest {
         let Some(prefix) = self.config.resolve_system_prompt_prefix(&request.model) else {
             return request;
         };

@@ -760,6 +760,9 @@ async fn handle_count_tokens(
 
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
+    // Mirror the generation path: the configured system-prompt prefix is part
+    // of the real upstream prompt, so it must be counted here too.
+    let responses_request = gateway.apply_system_prompt_prefix(responses_request);
     let lowered =
         crate::adapters::responses_to_chat::lower_request(&responses_request, Vec::new())?;
     let upstream_model = gateway.config().resolve_upstream_model(&original_model);
