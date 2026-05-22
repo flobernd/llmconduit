@@ -2820,7 +2820,10 @@ async fn gateway_tokenize_capability_defaults_unknown_and_updates() {
 
     assert_eq!(gateway.tokenize_capability(), TokenizeCapability::Unknown);
     gateway.set_tokenize_capability(TokenizeCapability::Unsupported);
-    assert_eq!(gateway.tokenize_capability(), TokenizeCapability::Unsupported);
+    assert_eq!(
+        gateway.tokenize_capability(),
+        TokenizeCapability::Unsupported
+    );
     gateway.set_tokenize_capability(TokenizeCapability::Supported);
     assert_eq!(gateway.tokenize_capability(), TokenizeCapability::Supported);
 }
@@ -5841,7 +5844,10 @@ async fn count_tokens_negative_cache_skips_second_upstream_call() {
         .iter()
         .filter(|req| req.url.path() == "/tokenize")
         .count();
-    assert_eq!(tokenize_hits, 1, "second call must be served from negative cache");
+    assert_eq!(
+        tokenize_hits, 1,
+        "second call must be served from negative cache"
+    );
 }
 
 #[tokio::test]

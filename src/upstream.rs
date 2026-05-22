@@ -348,7 +348,12 @@ impl UpstreamClient for ReqwestUpstreamClient {
 
     async fn count_tokens(&self, body: &serde_json::Value) -> AppResult<Option<u64>> {
         let url = derive_tokenize_url(&self.base_url);
-        let response = match self.with_auth(self.client.post(url)).json(body).send().await {
+        let response = match self
+            .with_auth(self.client.post(url))
+            .json(body)
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
                 tracing::debug!(error = %err, "upstream /tokenize request failed");
@@ -2034,7 +2039,10 @@ mod tests {
             ("http://host:8000/v1/", "http://host:8000/tokenize"),
             ("http://host:8000", "http://host:8000/tokenize"),
             ("http://host:8000/", "http://host:8000/tokenize"),
-            ("http://host:8000/openai/v1", "http://host:8000/openai/tokenize"),
+            (
+                "http://host:8000/openai/v1",
+                "http://host:8000/openai/tokenize",
+            ),
         ];
         for (base, expected) in cases {
             let url = super::derive_tokenize_url(&base.parse().expect("base url"));

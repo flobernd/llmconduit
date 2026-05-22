@@ -761,10 +761,7 @@ async fn handle_post_messages(
     }
 }
 
-async fn post_count_tokens(
-    State(gateway): State<Arc<Gateway>>,
-    body: Bytes,
-) -> Response {
+async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
     let request: AnthropicRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
@@ -791,18 +788,25 @@ async fn handle_count_tokens(
 
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
+    let resolved_model = gateway.resolve_request_model(&original_model).await;
+    // Mirror the generation path: the configured system-prompt prefix is part
+    // of the real upstream prompt, so it must be counted here too.
+    let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let lowered =
         crate::adapters::responses_to_chat::lower_request(&responses_request, Vec::new())?;
-    let upstream_model = gateway.config().resolve_upstream_model(&original_model);
     let body = serde_json::json!({
-        "model": upstream_model,
+        "model": resolved_model,
         "messages": lowered.messages,
     });
 
     match gateway.upstream_client().count_tokens(&body).await {
         Ok(Some(count)) => {
             gateway.set_tokenize_capability(TokenizeCapability::Supported);
-            Ok((StatusCode::OK, Json(serde_json::json!({ "input_tokens": count }))).into_response())
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "input_tokens": count })),
+            )
+                .into_response())
         }
         Ok(None) | Err(_) => {
             gateway.set_tokenize_capability(TokenizeCapability::Unsupported);

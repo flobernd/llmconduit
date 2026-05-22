@@ -375,7 +375,7 @@ impl Gateway {
         Ok(ReceiverStream::new(rx))
     }
 
-    fn apply_system_prompt_prefix(
+    pub(crate) fn apply_system_prompt_prefix(
         &self,
         mut request: ResponsesRequest,
         resolved_model: &str,
