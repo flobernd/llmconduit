@@ -19,26 +19,6 @@ cargo build --release
 ./target/release/llmconduit configure
 ```
 
-The default config path is:
-
-```text
-~/.config/llmconduit/config.yaml
-```
-
-Minimal config:
-
-```yaml
-bind_addr: "127.0.0.1:4000"
-upstream_base_url: "http://127.0.0.1:8000/v1"
-upstream_model: "Qwen3.5"
-```
-
-Optional Brave Search:
-
-```yaml
-brave_api_key: "..."
-```
-
 ## Run
 
 ```bash
