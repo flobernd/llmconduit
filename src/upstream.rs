@@ -230,12 +230,12 @@ async fn ensure_success(
         .filter_map(|result| async move {
             match result {
                 Ok(event) if event.data == "[DONE]" => {
-                    tracing::info!(target: "reasoning_debug", "<<DONE>>");
+                    append_reasoning_debug_line("<<DONE>>");
                     None
                 }
                 Ok(event) => {
                     if event.data.contains("reasoning") || event.data.contains("thinking") {
-                        tracing::info!(target: "reasoning_debug", chunk = %event.data, "raw chunk");
+                        append_reasoning_debug_line(&event.data);
                     }
                     Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
                         AppError::upstream(format!(
@@ -250,6 +250,20 @@ async fn ensure_success(
             }
         });
     Ok(Box::pin(stream))
+}
+
+fn append_reasoning_debug_line(line: &str) {
+    let path = std::env::var("LLMCONDUIT_REASONING_DEBUG_PATH")
+        .unwrap_or_else(|_| "reasoning-debug.log".to_string());
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _ = writeln!(file, "{ts} {line}");
 }
 
 fn parse_chat_completion_chunk(data: &str) -> Result<ChatCompletionChunk, serde_json::Error> {
