@@ -528,11 +528,27 @@
     .accordion.role-assistant .accordion-role { color: var(--text); }
     .accordion.role-reasoning .accordion-role { color: var(--reasoning); }
     .accordion.role-tool .accordion-role { color: var(--tool); }
+    .accordion.tool-call > .accordion-summary .accordion-role { color: var(--tool); }
+    .accordion.tool-result > .accordion-summary .accordion-role { color: var(--green); }
     .accordion > .segment {
       margin: 0;
       padding: 10px 12px;
       border-top: 1px solid var(--line);
       background: #0d0f12;
+    }
+    .accordion > .segment.tool-payload {
+      color: var(--output);
+      font-weight: 400;
+      font-style: normal;
+    }
+    .accordion-summary .tool-call-id {
+      margin-left: auto;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 400;
+      letter-spacing: 0;
+      text-transform: none;
     }
     .accordion.stale > .accordion-summary { opacity: 0.6; }
     .accordion.stale > .accordion-summary .accordion-role { color: var(--muted); }
@@ -1096,7 +1112,47 @@
     }
 
     _emit(type, detail) {
+      // While the tab is hidden, the WebSocket keeps streaming messages
+      // into the store, but firing change events causes custom elements
+      // to mutate the DOM and queue requestAnimationFrame callbacks
+      // (FLIP animations, stick-to-bottom scrolling). Browsers throttle
+      // rAF in hidden tabs, so those callbacks pile up and the
+      // mutations are never painted. When the tab returns, everything
+      // floods the main thread at once and the page appears frozen.
+      //
+      // Solution: coalesce changes while hidden, then dispatch a single
+      // batch on visibilitychange. Data still flows into the store --
+      // only the rendering is paused.
+      if (document.hidden) {
+        this._markDirty(type, detail);
+        return;
+      }
       this.dispatchEvent(new CustomEvent(type, { detail }));
+    }
+
+    _markDirty(type, detail) {
+      const d = this._dirty ||= { list: false, selection: false, search: false, requests: new Set() };
+      if (type === "list-changed") d.list = true;
+      else if (type === "selection-changed") d.selection = true;
+      else if (type === "search-changed") d.search = true;
+      else if (type === "request-changed" && detail?.id) d.requests.add(detail.id);
+    }
+
+    flushDirty() {
+      const d = this._dirty;
+      if (!d) return;
+      this._dirty = null;
+      // Selection-changed first so the right-pane element is the
+      // current one before list/request work runs against it. Search
+      // re-filters the sidebar; list reconciles sidebar + dashboard
+      // membership; per-request events then update surviving tiles
+      // and the detail view.
+      if (d.selection) this.dispatchEvent(new CustomEvent("selection-changed"));
+      if (d.search) this.dispatchEvent(new CustomEvent("search-changed"));
+      if (d.list) this.dispatchEvent(new CustomEvent("list-changed"));
+      for (const id of d.requests) {
+        this.dispatchEvent(new CustomEvent("request-changed", { detail: { id } }));
+      }
     }
   }
 
@@ -2246,137 +2302,294 @@
 
       const sections = [];
 
-      // System prompt + input messages parsed from the upstream payload.
+      // System prompt + conversation items parsed from the upstream payload.
       // When there's been a previous upstream call on this request, mark
       // everything carried over from it as "stale" so it can default closed.
-      const parsedPrompt = this._parsePromptPayload(request);
-      const prevCount = this._countPreviousMessages(request);
-      if (parsedPrompt) {
-        if (parsedPrompt.system) {
-          sections.push({ label: "System", role: "system", body: parsedPrompt.system, stale: true });
+      const parsed = this._parseConversation(request);
+      const prevCount = this._countPreviousItems(request);
+      if (parsed) {
+        if (parsed.system) {
+          sections.push({ kind: "message", label: "System", role: "system", body: parsed.system, stale: true });
         }
-        parsedPrompt.messages.forEach((msg, idx) => {
-          sections.push({
-            label: msg.role.charAt(0).toUpperCase() + msg.role.slice(1),
-            role: msg.role,
-            body: msg.content,
-            stale: idx < prevCount,
-          });
+        parsed.items.forEach((item, idx) => {
+          const stale = idx < prevCount;
+          if (item.kind === "message") {
+            sections.push({
+              kind: "message",
+              label: item.role.charAt(0).toUpperCase() + item.role.slice(1),
+              role: item.role,
+              body: item.content,
+              stale,
+            });
+          } else if (item.kind === "tool_call") {
+            sections.push({
+              kind: "tool_call",
+              label: `Tool call → ${item.name || "unknown"}`,
+              role: "tool",
+              item,
+              stale,
+            });
+          } else if (item.kind === "tool_result") {
+            sections.push({
+              kind: "tool_result",
+              label: "Tool result",
+              role: "tool",
+              item,
+              stale,
+            });
+          }
         });
       }
 
-      // Assistant output: reasoning collapsed separately, then plain output.
+      // Live-streamed current turn from segments. The completed tool call
+      // shows up in the next request's input as a structured tool_call item;
+      // these segments are the only view we have while it's still streaming.
       const segs = request.segments || [];
       let reasoning = "";
       let output = "";
-      let tool = "";
+      let toolStream = "";
       for (const seg of segs) {
         if (seg.kind === "reasoning") reasoning += seg.text;
-        else if (seg.kind === "tool") tool += seg.text;
+        else if (seg.kind === "tool") toolStream += seg.text;
         else output += seg.text;
       }
-      if (reasoning.trim()) sections.push({ label: "Reasoning", role: "reasoning", body: reasoning, stale: false });
-      if (tool.trim()) sections.push({ label: "Tool", role: "tool", body: tool, stale: false });
-      if (output.trim()) sections.push({ label: "Assistant", role: "assistant", body: output, stale: false });
+      if (reasoning.trim()) sections.push({ kind: "message", label: "Reasoning", role: "reasoning", body: reasoning, stale: false });
+      if (toolStream.trim()) sections.push({ kind: "message", label: "Tool stream", role: "tool", body: toolStream, stale: false });
+      if (output.trim()) sections.push({ kind: "message", label: "Assistant", role: "assistant", body: output, stale: false });
 
       if (!sections.length) { this._empty("No messages yet"); return; }
 
-      // Default: system is always collapsed; carry-over messages from a
-      // prior upstream are collapsed; everything new on this request is open.
       for (const section of sections) {
-        const details = document.createElement("details");
-        details.className = `accordion role-${section.role}${section.stale ? " stale" : ""}`;
-        details.open = !section.stale && section.role !== "system";
-        const summary = document.createElement("summary");
-        summary.className = "accordion-summary";
-        summary.innerHTML = `<span class="accordion-role">${escapeHtml(section.label)}</span>`;
-        details.appendChild(summary);
-        const pre = document.createElement("pre");
-        pre.className = `segment ${section.role === "reasoning" ? "reasoning" : section.role === "tool" ? "tool" : "output"}`;
-        pre.textContent = section.body;
-        details.appendChild(pre);
-        this._pane.appendChild(details);
+        if (section.kind === "tool_call") {
+          this._pane.appendChild(this._renderToolCard(section, "tool-call", "Arguments", section.item.arguments));
+        } else if (section.kind === "tool_result") {
+          this._pane.appendChild(this._renderToolCard(section, "tool-result", "Output", section.item.output));
+        } else {
+          this._pane.appendChild(this._renderMessageSection(section));
+        }
       }
     }
 
-    // Returns the message count from the most recent *prior* upstream call
-    // on this request — anything at index < this count in the current
-    // payload is carry-over and should default to collapsed.
-    _countPreviousMessages(request) {
+    _renderMessageSection(section) {
+      const details = document.createElement("details");
+      details.className = `accordion role-${section.role}${section.stale ? " stale" : ""}`;
+      details.open = !section.stale && section.role !== "system";
+      const summary = document.createElement("summary");
+      summary.className = "accordion-summary";
+      summary.innerHTML = `<span class="accordion-role">${escapeHtml(section.label)}</span>`;
+      details.appendChild(summary);
+      const pre = document.createElement("pre");
+      pre.className = `segment ${section.role === "reasoning" ? "reasoning" : section.role === "tool" ? "tool" : "output"}`;
+      pre.textContent = section.body;
+      details.appendChild(pre);
+      return details;
+    }
+
+    _renderToolCard(section, variant, _fieldLabel, payload) {
+      const details = document.createElement("details");
+      details.className = `accordion role-tool ${variant}${section.stale ? " stale" : ""}`;
+      details.open = !section.stale;
+      const summary = document.createElement("summary");
+      summary.className = "accordion-summary";
+      const callId = section.item.call_id ? `<span class="tool-call-id">${escapeHtml(section.item.call_id)}</span>` : "";
+      summary.innerHTML = `<span class="accordion-role">${escapeHtml(section.label)}</span>${callId}`;
+      details.appendChild(summary);
+      const pre = document.createElement("pre");
+      pre.className = "segment tool-payload";
+      pre.textContent = this._prettyJson(payload);
+      details.appendChild(pre);
+      return details;
+    }
+
+    _prettyJson(value) {
+      if (value === null || value === undefined) return "";
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        if ((trimmed.startsWith("{") && trimmed.endsWith("}"))
+                || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+          try { return JSON.stringify(JSON.parse(trimmed), null, 2); } catch (_) { /* fallthrough */ }
+        }
+        return value;
+      }
+      try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+    }
+
+    // Returns the conversation item count from the most recent *prior*
+    // upstream call on this request — anything at index < this count in the
+    // current payload is carry-over and should default to collapsed.
+    _countPreviousItems(request) {
       const events = (request.events || []).filter(it =>
               (it.kind === "upstream_request" || it.kind === "request_payload") && it.payload_preview
       );
       if (events.length < 2) return 0;
-      const prev = events[events.length - 2];
-      let parsed = null;
-      try { parsed = JSON.parse(prev.payload_preview); } catch (_) { return 0; }
-      if (!parsed) return 0;
-      if (Array.isArray(parsed.messages)) {
-        return parsed.messages.filter(m => m && m.role !== "system" && this._flatten(m.content)).length;
-      }
-      if (Array.isArray(parsed.input)) {
-        return parsed.input.filter(it => {
-          if (!it) return false;
-          if (typeof it === "object" && it.role === "system") return false;
-          return Boolean(this._flatten(typeof it === "object" ? it.content : it));
-        }).length;
-      }
-      if (parsed.input !== undefined) return 1;
-      return 0;
+      const prev = this._parseConversationFromEvent(events[events.length - 2]);
+      return prev ? prev.items.length : 0;
     }
 
-    _parsePromptPayload(request) {
+    _parseConversation(request) {
       const events = [...(request.events || [])].reverse();
       const event = events.find(it => it.kind === "upstream_request" && it.payload_preview)
               || events.find(it => it.kind === "request_payload" && it.payload_preview);
+      return this._parseConversationFromEvent(event);
+    }
+
+    _parseConversationFromEvent(event) {
       if (!event) return null;
       let parsed = null;
       try { parsed = JSON.parse(event.payload_preview); } catch (_) { return null; }
       if (!parsed) return null;
 
       let system = "";
-      const messages = [];
-
-      // Anthropic style: top-level `system` + `messages[]`.
       if (typeof parsed.system === "string") {
         system = parsed.system;
       } else if (Array.isArray(parsed.system)) {
-        system = this._flatten(parsed.system);
+        system = this._flattenText(parsed.system);
       }
 
-      if (Array.isArray(parsed.messages)) {
-        for (const msg of parsed.messages) {
-          const role = typeof msg.role === "string" ? msg.role : "?";
-          const content = this._flatten(msg.content);
-          if (!content) continue;
-          if (role === "system" && !system) { system = content; continue; }
-          messages.push({ role, content });
+      const items = [];
+      const pushFromContent = (role, content) => {
+        if (content === null || content === undefined) return;
+        if (typeof content === "string") {
+          if (content) items.push({ kind: "message", role, content });
+          return;
         }
-      } else if (parsed.input !== undefined) {
-        // OpenAI Responses style: `input` may be a string or array of items.
-        if (Array.isArray(parsed.input)) {
-          for (const item of parsed.input) {
-            if (item && typeof item === "object" && typeof item.role === "string") {
-              const content = this._flatten(item.content);
-              if (!content) continue;
-              if (item.role === "system" && !system) { system = content; continue; }
-              messages.push({ role: item.role, content });
-            } else {
-              const content = this._flatten(item);
-              if (content) messages.push({ role: "user", content });
+        const blocks = Array.isArray(content) ? content : [content];
+        let textBuf = "";
+        const appendText = (text) => {
+          if (!text) return;
+          if (textBuf) textBuf += "\n";
+          textBuf += text;
+        };
+        const flushText = () => {
+          if (textBuf) {
+            items.push({ kind: "message", role, content: textBuf });
+            textBuf = "";
+          }
+        };
+        for (const block of blocks) {
+          if (typeof block === "string") { appendText(block); continue; }
+          if (!block || typeof block !== "object") continue;
+          const t = block.type;
+          if (t === "text" || t === "input_text" || t === "output_text" || typeof block.text === "string") {
+            appendText(block.text || "");
+          } else if (t === "tool_use") {
+            flushText();
+            items.push({
+              kind: "tool_call",
+              name: block.name || "",
+              call_id: block.id || "",
+              arguments: block.input,
+            });
+          } else if (t === "tool_result") {
+            flushText();
+            items.push({
+              kind: "tool_result",
+              call_id: block.tool_use_id || "",
+              output: block.content !== undefined ? block.content : block.output,
+            });
+          } else if (t === "image" || t === "input_image") {
+            appendText("[image]");
+          } else {
+            appendText(`[${t || "block"}]`);
+          }
+        }
+        flushText();
+      };
+
+      if (Array.isArray(parsed.messages)) {
+        // Anthropic and OpenAI Chat Completions: top-level messages[].
+        for (const msg of parsed.messages) {
+          if (!msg) continue;
+          const role = typeof msg.role === "string" ? msg.role : "user";
+          if (role === "system") {
+            if (!system) {
+              const text = typeof msg.content === "string" ? msg.content : this._flattenText(msg.content);
+              if (text) system = text;
+            }
+            continue;
+          }
+          if (role === "tool") {
+            // Chat Completions tool result message.
+            items.push({
+              kind: "tool_result",
+              call_id: msg.tool_call_id || "",
+              output: msg.content !== undefined ? msg.content : msg.output,
+            });
+            continue;
+          }
+          pushFromContent(role, msg.content);
+          if (Array.isArray(msg.tool_calls)) {
+            for (const tc of msg.tool_calls) {
+              if (!tc) continue;
+              const fn = tc.function || {};
+              let args = fn.arguments;
+              if (typeof args === "string") {
+                try { args = JSON.parse(args); } catch (_) { /* keep string */ }
+              }
+              items.push({
+                kind: "tool_call",
+                name: fn.name || tc.name || "",
+                call_id: tc.id || "",
+                arguments: args,
+              });
             }
           }
-        } else {
-          const content = this._flatten(parsed.input);
-          if (content) messages.push({ role: "user", content });
+        }
+      } else if (parsed.input !== undefined) {
+        // OpenAI Responses: `input` is a string or an array of typed items.
+        if (Array.isArray(parsed.input)) {
+          for (const item of parsed.input) {
+            if (!item) continue;
+            if (typeof item === "string") {
+              items.push({ kind: "message", role: "user", content: item });
+              continue;
+            }
+            if (typeof item !== "object") continue;
+            const t = item.type;
+            if (t === "function_call") {
+              let args = item.arguments;
+              if (typeof args === "string") {
+                try { args = JSON.parse(args); } catch (_) { /* keep string */ }
+              }
+              items.push({
+                kind: "tool_call",
+                name: item.name || "",
+                call_id: item.call_id || item.id || "",
+                arguments: args,
+              });
+            } else if (t === "function_call_output") {
+              let out = item.output;
+              if (typeof out === "string") {
+                try { out = JSON.parse(out); } catch (_) { /* keep string */ }
+              }
+              items.push({
+                kind: "tool_result",
+                call_id: item.call_id || "",
+                output: out,
+              });
+            } else if (typeof item.role === "string") {
+              if (item.role === "system") {
+                if (!system) {
+                  const text = typeof item.content === "string" ? item.content : this._flattenText(item.content);
+                  if (text) system = text;
+                }
+              } else {
+                pushFromContent(item.role, item.content);
+              }
+            } else if (typeof item.text === "string") {
+              items.push({ kind: "message", role: "user", content: item.text });
+            }
+          }
+        } else if (typeof parsed.input === "string") {
+          if (parsed.input) items.push({ kind: "message", role: "user", content: parsed.input });
         }
         if (typeof parsed.instructions === "string" && !system) system = parsed.instructions;
       }
 
-      return { system, messages };
+      return { system, items };
     }
 
-    _flatten(value) {
+    _flattenText(value) {
       if (value === null || value === undefined) return "";
       if (typeof value === "string") return value;
       if (!Array.isArray(value)) {
@@ -2391,11 +2604,7 @@
       };
       for (const item of value) {
         if (typeof item === "string") push(item);
-        else if (item && typeof item === "object") {
-          if (typeof item.text === "string") push(item.text);
-          else if (item.content !== undefined) push(this._flatten(item.content));
-          else if (typeof item.type === "string") push(`[${item.type}]`);
-        }
+        else if (item && typeof item === "object" && typeof item.text === "string") push(item.text);
       }
       return out;
     }
@@ -2560,6 +2769,11 @@
       store.dispatchEvent(new CustomEvent("list-changed"));
       return;
     }
+    // Skip the per-tile DOM tick when the tab is hidden -- the dashboard
+    // isn't visible and the rAF callbacks scheduled inside tile.refresh()
+    // would just queue up to flood the main thread on return. Tiles will
+    // re-render through flushDirty() on visibilitychange.
+    if (document.hidden) return;
     // Per-tile refresh (only when dashboard is mounted). We tick tiles for
     // the elapsed clock + linger countdown, but only call dashboard.refresh()
     // -- which walks every request via dashboardVisibleRequests() -- when at
@@ -2605,6 +2819,14 @@
   }
 
   socket.start();
+
+  // Flush any changes that accumulated while the tab was hidden. The
+  // store buffers dirty state during background time so the DOM isn't
+  // mutated and rAF callbacks aren't queued for events the user can't
+  // see; this fires one batched re-render on return.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) store.flushDirty();
+  });
 </script>
 </body>
 </html>
