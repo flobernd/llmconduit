@@ -229,13 +229,21 @@ async fn ensure_success(
         .eventsource()
         .filter_map(|result| async move {
             match result {
-                Ok(event) if event.data == "[DONE]" => None,
-                Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
-                    AppError::upstream(format!(
-                        "failed to parse upstream chat chunk: {err}; payload={}",
-                        truncate_for_error(&event.data, 500)
-                    ))
-                })),
+                Ok(event) if event.data == "[DONE]" => {
+                    eprintln!("[reasoning-debug] <<DONE>>");
+                    None
+                }
+                Ok(event) => {
+                    if event.data.contains("reasoning") || event.data.contains("thinking") {
+                        eprintln!("[reasoning-debug] raw chunk: {}", event.data);
+                    }
+                    Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
+                        AppError::upstream(format!(
+                            "failed to parse upstream chat chunk: {err}; payload={}",
+                            truncate_for_error(&event.data, 500)
+                        ))
+                    }))
+                }
                 Err(err) => Some(Err(AppError::upstream(format!(
                     "failed to read upstream SSE: {err}"
                 )))),
