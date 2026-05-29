@@ -1782,7 +1782,7 @@ fn is_tool_output_item(item: &ResponseItem) -> bool {
 }
 
 fn preview_text(text: &str) -> String {
-    const LIMIT: usize = 120;
+    const LIMIT: usize = 1024;
     if text.chars().count() <= LIMIT {
         text.to_string()
     } else {
@@ -1807,11 +1807,11 @@ mod tests {
 
     #[test]
     fn preview_text_truncates_on_char_boundary() {
-        let text = format!("{}é", "a".repeat(119));
-        assert_eq!(preview_text(&text), format!("{}é", "a".repeat(119)));
+        let text = format!("{}é", "a".repeat(1023));
+        assert_eq!(preview_text(&text), format!("{}é", "a".repeat(1023)));
 
-        let text = format!("{}éβ", "a".repeat(119));
-        assert_eq!(preview_text(&text), format!("{}é...", "a".repeat(119)));
+        let text = format!("{}éβ", "a".repeat(1023));
+        assert_eq!(preview_text(&text), format!("{}é...", "a".repeat(1023)));
     }
 
     #[test]

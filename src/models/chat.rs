@@ -231,21 +231,42 @@ pub struct ChatDelta {
 
 impl ChatDelta {
     pub fn reasoning_delta(&self) -> Option<&str> {
-        self.reasoning_content
+        // Treat empty reasoning_content as absent so we fall through to alternate
+        // fields when an upstream emits an empty placeholder alongside the real text.
+        if let Some(text) = self
+            .reasoning_content
             .as_deref()
-            .or_else(|| {
-                [
-                    "reasoning",
-                    "reasoning_text",
-                    "reasoning_delta",
-                    "thinking",
-                    "thinking_content",
-                ]
-                .into_iter()
-                .find_map(|key| self.extra.get(key).and_then(Value::as_str))
-            })
-            .or_else(|| self.thinking_object_field("content"))
-            .or_else(|| self.thinking_object_field("thinking"))
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text);
+        }
+        for key in [
+            "reasoning",
+            "reasoning_text",
+            "reasoning_delta",
+            "reasoning_summary",
+            "thinking",
+            "thinking_content",
+        ] {
+            let Some(value) = self.extra.get(key) else {
+                continue;
+            };
+            if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+                return Some(text);
+            }
+            if let Some(object) = value.as_object() {
+                for nested in ["text", "delta", "content", "summary", "thinking"] {
+                    if let Some(text) = object
+                        .get(nested)
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn reasoning_signature_delta(&self) -> Option<&str> {
