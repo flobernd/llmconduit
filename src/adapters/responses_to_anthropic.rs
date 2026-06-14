@@ -14,6 +14,8 @@ use serde_json::Value;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+const ESTIMATED_OUTPUT_TOKEN_BYTES: usize = 4;
+
 enum ContentBlockState {
     Thinking { index: usize },
     Text { index: usize },
@@ -29,6 +31,8 @@ pub struct AnthropicStreamConverter {
     started: bool,
     completed: bool,
     pending_input_tokens: Option<u64>,
+    estimated_output_bytes: usize,
+    last_output_tokens: u64,
     web_search_count: u64,
     emitted_tool_call_ids: HashSet<String>,
     closed_tool_call_ids: HashSet<String>,
@@ -45,6 +49,8 @@ impl AnthropicStreamConverter {
             started: false,
             completed: false,
             pending_input_tokens: None,
+            estimated_output_bytes: 0,
+            last_output_tokens: 0,
             web_search_count: 0,
             emitted_tool_call_ids: HashSet::new(),
             closed_tool_call_ids: HashSet::new(),
@@ -148,6 +154,7 @@ impl AnthropicStreamConverter {
                         text: delta.to_string(),
                     },
                 });
+                self.record_output_delta(delta, output);
             }
             _ => {
                 self.close_open_block(output);
@@ -159,6 +166,7 @@ impl AnthropicStreamConverter {
                             text: delta.to_string(),
                         },
                     });
+                    self.record_output_delta(delta, output);
                 }
             }
         }
@@ -177,6 +185,7 @@ impl AnthropicStreamConverter {
                         thinking: delta.to_string(),
                     },
                 });
+                self.record_output_delta(delta, output);
             }
             _ => {
                 self.close_open_block(output);
@@ -188,6 +197,7 @@ impl AnthropicStreamConverter {
                             thinking: delta.to_string(),
                         },
                     });
+                    self.record_output_delta(delta, output);
                 }
             }
         }
@@ -242,6 +252,7 @@ impl AnthropicStreamConverter {
                     partial_json: delta.to_string(),
                 },
             });
+            self.record_output_delta(delta, output);
         }
     }
 
@@ -289,6 +300,7 @@ impl AnthropicStreamConverter {
                     partial_json: arguments.to_string(),
                 },
             });
+            self.record_output_delta(arguments, output);
         }
         self.close_open_block(output);
         self.emitted_tool_call_ids.insert(call_id.to_string());
@@ -340,16 +352,16 @@ impl AnthropicStreamConverter {
         self.close_open_block(&mut output);
         output.push(AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDeltaBody {
-                stop_reason: if self.has_tool_calls {
+                stop_reason: Some(if self.has_tool_calls {
                     "tool_use".to_string()
                 } else {
                     "end_turn".to_string()
-                },
+                }),
                 stop_sequence: None,
             },
             usage: AnthropicUsage {
                 input_tokens: self.pending_input_tokens,
-                output_tokens: Some(0),
+                output_tokens: Some(self.last_output_tokens),
                 server_tool_use: self.server_tool_use_usage(),
             },
         });
@@ -365,6 +377,12 @@ impl AnthropicStreamConverter {
         if let Some(usage) = usage.as_ref() {
             self.pending_input_tokens = Some(usage.input_tokens);
         }
+        let output_tokens = usage
+            .as_ref()
+            .map(|usage| usage.output_tokens)
+            .unwrap_or(self.last_output_tokens)
+            .max(self.last_output_tokens);
+        self.last_output_tokens = output_tokens;
         let stop_reason = if let Some(reason) = response_stop_reason(data) {
             reason
         } else if self.has_tool_calls {
@@ -374,12 +392,12 @@ impl AnthropicStreamConverter {
         };
         output.push(AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDeltaBody {
-                stop_reason,
+                stop_reason: Some(stop_reason),
                 stop_sequence: None,
             },
             usage: AnthropicUsage {
                 input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
-                output_tokens: Some(usage.as_ref().map_or(0, |usage| usage.output_tokens)),
+                output_tokens: Some(output_tokens),
                 server_tool_use: self.server_tool_use_usage(),
             },
         });
@@ -472,6 +490,31 @@ impl AnthropicStreamConverter {
         }
     }
 
+    fn record_output_delta(&mut self, delta: &str, output: &mut Vec<AnthropicStreamEvent>) {
+        if delta.is_empty() {
+            return;
+        }
+        self.estimated_output_bytes = self.estimated_output_bytes.saturating_add(delta.len());
+        let estimated_tokens = self
+            .estimated_output_bytes
+            .div_ceil(ESTIMATED_OUTPUT_TOKEN_BYTES) as u64;
+        if estimated_tokens <= self.last_output_tokens {
+            return;
+        }
+        self.last_output_tokens = estimated_tokens;
+        output.push(AnthropicStreamEvent::MessageDelta {
+            delta: AnthropicMessageDeltaBody {
+                stop_reason: None,
+                stop_sequence: None,
+            },
+            usage: AnthropicUsage {
+                input_tokens: None,
+                output_tokens: Some(estimated_tokens),
+                server_tool_use: None,
+            },
+        });
+    }
+
     fn start_text_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
         let index = self.next_block_index;
         self.next_block_index += 1;
@@ -555,6 +598,7 @@ impl AnthropicStreamConverter {
                     partial_json: arguments.to_string(),
                 },
             });
+            self.record_output_delta(arguments, output);
         }
         self.close_open_block(output);
         self.emitted_tool_call_ids.insert(call_id.to_string());
@@ -699,8 +743,12 @@ impl AnthropicStreamCollector {
                     }
                 }
                 AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                    self.stop_reason = Some(delta.stop_reason);
-                    self.output_tokens = usage.output_tokens.unwrap_or(0);
+                    if let Some(stop_reason) = delta.stop_reason {
+                        self.stop_reason = Some(stop_reason);
+                    }
+                    if let Some(output_tokens) = usage.output_tokens {
+                        self.output_tokens = output_tokens;
+                    }
                 }
                 AnthropicStreamEvent::Error { error } => {
                     self.error = Some(error);
@@ -976,7 +1024,9 @@ mod tests {
                 "message_start",
                 "content_block_start",
                 "content_block_delta",
+                "message_delta",
                 "content_block_delta",
+                "message_delta",
                 "content_block_stop",
                 "message_delta",
                 "message_stop",
@@ -1008,11 +1058,13 @@ mod tests {
                 "message_start",
                 "content_block_start", // thinking
                 "content_block_delta", // thinking delta
+                "message_delta",       // progressive usage
                 "content_block_stop",  // close thinking before text
                 "content_block_start", // text
                 "content_block_delta", // text delta
+                "message_delta",       // progressive usage
                 "content_block_stop",  // close text
-                "message_delta",
+                "message_delta",       // terminal stop reason
                 "message_stop",
             ]
         );
@@ -1073,11 +1125,13 @@ mod tests {
                 "message_start",
                 "content_block_start", // text
                 "content_block_delta", // text delta
+                "message_delta",       // progressive usage
                 "content_block_stop",  // close text
                 "content_block_start", // tool_use
                 "content_block_delta", // input_json_delta
+                "message_delta",       // progressive usage
                 "content_block_stop",  // close tool_use
-                "message_delta",
+                "message_delta",       // terminal stop reason
                 "message_stop",
             ]
         );
@@ -1122,7 +1176,9 @@ mod tests {
                 "message_start",
                 "content_block_start",
                 "content_block_delta",
+                "message_delta",
                 "content_block_delta",
+                "message_delta",
                 "content_block_stop",
                 "message_delta",
                 "message_stop",
@@ -1225,6 +1281,67 @@ mod tests {
     }
 
     #[test]
+    fn emits_progress_usage_for_reasoning_deltas() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("abcd"),
+            reasoning_delta_event("efgh"),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let message_deltas: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AnthropicStreamEvent::MessageDelta { delta, usage } => Some((delta, usage)),
+                _ => None,
+            })
+            .collect();
+        let output_tokens: Vec<u64> = message_deltas
+            .iter()
+            .filter_map(|(_, usage)| usage.output_tokens)
+            .collect();
+        assert_eq!(output_tokens, vec![1, 2]);
+        assert!(
+            message_deltas
+                .iter()
+                .all(|(delta, _)| delta.stop_reason.is_none()),
+            "progress usage must not terminate the message"
+        );
+    }
+
+    #[test]
+    fn completed_without_upstream_usage_preserves_progress_usage() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("abcd"),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let terminal_delta = events
+            .iter()
+            .filter_map(|event| match event {
+                AnthropicStreamEvent::MessageDelta { delta, usage } => {
+                    delta.stop_reason.as_ref().map(|reason| (reason, usage))
+                }
+                _ => None,
+            })
+            .next()
+            .expect("terminal message_delta");
+        assert_eq!(terminal_delta.0, "end_turn");
+        assert_eq!(terminal_delta.1.output_tokens, Some(1));
+    }
+
+    #[test]
     fn converts_incomplete_to_max_tokens_stop_reason() {
         let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
         let events: Vec<AnthropicStreamEvent> = [
@@ -1242,7 +1359,7 @@ mod tests {
                 _ => None,
             })
             .expect("message_delta");
-        assert_eq!(message_delta.stop_reason, "max_tokens");
+        assert_eq!(message_delta.stop_reason.as_deref(), Some("max_tokens"));
     }
 
     #[test]
@@ -1470,7 +1587,7 @@ mod tests {
         // Server-side tool: turn still ends with end_turn, not tool_use.
         let msg_delta = jsons
             .iter()
-            .find(|j| j["type"] == "message_delta")
+            .find(|j| j["type"] == "message_delta" && j["delta"]["stop_reason"].is_string())
             .expect("message_delta");
         assert_eq!(msg_delta["delta"]["stop_reason"], "end_turn");
     }
@@ -1497,8 +1614,13 @@ mod tests {
 
         let md = events
             .iter()
-            .find(|e| matches!(e, AnthropicStreamEvent::MessageDelta { .. }))
-            .map(|e| serde_json::from_str::<Value>(&e.to_json()).unwrap())
+            .filter_map(|e| match e {
+                AnthropicStreamEvent::MessageDelta { .. } => {
+                    Some(serde_json::from_str::<Value>(&e.to_json()).unwrap())
+                }
+                _ => None,
+            })
+            .find(|j| j["usage"].get("server_tool_use").is_some())
             .expect("message_delta");
         assert_eq!(md["usage"]["server_tool_use"]["web_search_requests"], 2);
     }

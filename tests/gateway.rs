@@ -3843,9 +3843,24 @@ async fn anthropic_messages_streams_text_response() {
     assert!(body_text.contains("Hello"), "missing text content");
     assert!(body_text.contains(" there"), "missing second text delta");
     let anthropic_events = parse_anthropic_sse_events(&body_text);
+    let progress_tokens: Vec<u64> = anthropic_events
+        .iter()
+        .filter(|event| event["type"] == "message_delta" && event["delta"]["stop_reason"].is_null())
+        .filter_map(|event| event["usage"]["output_tokens"].as_u64())
+        .collect();
+    assert!(
+        !progress_tokens.is_empty(),
+        "expected progressive output-token usage"
+    );
+    assert!(
+        progress_tokens.windows(2).all(|pair| pair[0] < pair[1]),
+        "progress output tokens must increase monotonically: {progress_tokens:?}"
+    );
     let message_delta = anthropic_events
         .iter()
-        .find(|event| event["type"] == "message_delta")
+        .find(|event| {
+            event["type"] == "message_delta" && event["delta"]["stop_reason"] == "end_turn"
+        })
         .expect("message_delta event");
     assert_eq!(message_delta["usage"]["input_tokens"], 12);
     assert_eq!(message_delta["usage"]["output_tokens"], 5);
@@ -3915,6 +3930,21 @@ async fn anthropic_messages_streams_nested_thinking_response() {
             && event["delta"]["type"] == "text_delta"
             && event["delta"]["text"] == "Answer"
     }));
+    let thinking_progress_tokens: Vec<u64> = anthropic_events
+        .iter()
+        .filter(|event| event["type"] == "message_delta" && event["delta"]["stop_reason"].is_null())
+        .filter_map(|event| event["usage"]["output_tokens"].as_u64())
+        .collect();
+    assert!(
+        !thinking_progress_tokens.is_empty(),
+        "expected progressive output-token usage while thinking"
+    );
+    assert!(
+        thinking_progress_tokens
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "thinking progress output tokens must increase monotonically: {thinking_progress_tokens:?}"
+    );
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);

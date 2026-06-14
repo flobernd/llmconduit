@@ -399,7 +399,7 @@ pub enum AnthropicDelta {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnthropicMessageDeltaBody {
-    pub stop_reason: String,
+    pub stop_reason: Option<String>,
     pub stop_sequence: Option<Value>,
 }
 
