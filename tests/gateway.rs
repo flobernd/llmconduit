@@ -220,6 +220,7 @@ async fn streams_function_call_turn() {
         tool_choice: json!("auto"),
         parallel_tool_calls: true,
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -377,6 +378,7 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
         tool_choice: json!("auto"),
         parallel_tool_calls: true,
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -439,7 +441,6 @@ async fn uses_configured_upstream_model_override() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: Some("grok-4".to_string()),
-            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -515,7 +516,6 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: Some("alias-from-config".to_string()),
-            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -853,7 +853,6 @@ async fn forwards_configured_upstream_chat_kwargs() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: Some("GLM-5.1".to_string()),
-            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::from_iter([(
@@ -905,7 +904,6 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -924,6 +922,8 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                             "preserve_thinking": true
                         }),
                     )]),
+                    reasoning_effort: None,
+                    capabilities: None,
                 },
             )]),
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -967,6 +967,8 @@ async fn prepends_profile_system_prompt_prefix_for_responses_requests() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
+            reasoning_effort: None,
+            capabilities: None,
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -1515,7 +1517,6 @@ async fn proxies_models_endpoint_with_etag() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
-        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -1580,7 +1581,6 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("upstream-secret".to_string()),
         upstream_model: None,
-        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -1651,7 +1651,6 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
-        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -1706,6 +1705,139 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
 }
 
 #[tokio::test]
+async fn anthropic_models_advertise_thinking_capabilities_for_glm_profiles() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "glm-5.2"}, {"id": "qwen3"}]
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.2".to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_model: None,
+            system_prompt_prefix: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            reasoning_effort: None,
+            capabilities: Some(
+                serde_json::from_value::<llmconduit::config::CapabilitiesConfig>(json!({
+                    "thinking": {"types": ["enabled"]},
+                    "effort": {"levels": ["medium", "xhigh"]}
+                }))
+                .expect("caps"),
+            ),
+        },
+    )]);
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    let models = body["data"].as_array().expect("data array");
+    let glm = models
+        .iter()
+        .find(|model| model["id"] == "glm-5.2")
+        .expect("glm-5.2 entry");
+    assert_eq!(glm["capabilities"]["thinking"]["supported"], true);
+    assert_eq!(
+        glm["capabilities"]["thinking"]["types"]["enabled"]["supported"],
+        true
+    );
+    assert_eq!(glm["capabilities"]["effort"]["supported"], true);
+    assert_eq!(glm["capabilities"]["effort"]["medium"]["supported"], true);
+    assert_eq!(glm["capabilities"]["effort"]["xhigh"]["supported"], true);
+    let qwen = models
+        .iter()
+        .find(|model| model["id"] == "qwen3")
+        .expect("qwen3 entry");
+    assert_eq!(qwen["capabilities"]["thinking"]["supported"], false);
+}
+
+#[tokio::test]
+async fn anthropic_models_advertise_glm_capabilities_for_alias_targeting_upstream() {
+    // The GLM profile is keyed by a client alias that targets the upstream id;
+    // /v1/models lists the upstream id, not the alias. The advertised upstream
+    // entry must still show GLM capabilities because a profile resolves to it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "glm-5.2"}, {"id": "qwen3"}]
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "client-glm".to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_model: Some("glm-5.2".to_string()),
+            system_prompt_prefix: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            reasoning_effort: None,
+            capabilities: Some(
+                serde_json::from_value::<llmconduit::config::CapabilitiesConfig>(json!({
+                    "thinking": {"types": ["adaptive"]},
+                    "effort": {"levels": ["max"]}
+                }))
+                .expect("caps"),
+            ),
+        },
+    )]);
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    let models = body["data"].as_array().expect("data array");
+    let glm = models
+        .iter()
+        .find(|model| model["id"] == "glm-5.2")
+        .expect("glm-5.2 entry");
+    assert_eq!(glm["capabilities"]["thinking"]["supported"], true);
+    assert_eq!(glm["capabilities"]["effort"]["supported"], true);
+    let qwen = models
+        .iter()
+        .find(|model| model["id"] == "qwen3")
+        .expect("qwen3 entry");
+    assert_eq!(qwen["capabilities"]["thinking"]["supported"], false);
+}
+
+#[tokio::test]
 async fn paginates_anthropic_models_transform_with_cursors() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -1725,7 +1857,6 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
-        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -1804,7 +1935,6 @@ async fn proxies_completions_endpoint_passthrough() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("upstream-secret".to_string()),
         upstream_model: None,
-        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -2668,6 +2798,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
         tool_choice: json!("auto"),
         parallel_tool_calls: true,
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -2780,6 +2911,7 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
         tool_choice: json!("auto"),
         parallel_tool_calls: true,
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -2879,7 +3011,6 @@ fn test_config() -> Config {
         upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
-        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -2910,6 +3041,7 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
             effort: Some("medium".to_string()),
             summary: None,
         }),
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -3817,6 +3949,8 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                     "shared": "model"
                 }),
             )]),
+            reasoning_effort: None,
+            capabilities: None,
         },
     )]);
 
@@ -4345,6 +4479,8 @@ async fn chat_completions_prepends_profile_system_prompt_prefix() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
+            reasoning_effort: None,
+            capabilities: None,
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -4511,6 +4647,7 @@ async fn anthropic_messages_streams_nested_thinking_response() {
             "type": "enabled",
             "budget_tokens": 1024
         },
+        "output_config": { "effort": "max" },
         "messages": [
             { "role": "user", "content": "Think then answer." }
         ]
@@ -4569,8 +4706,556 @@ async fn anthropic_messages_streams_nested_thinking_response() {
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].stream, true);
-    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("high"));
+    // No profile matches this model, so the client effort passes through verbatim;
+    // budget_tokens is ignored and output_config.effort "max" is forwarded as-is.
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("max"));
     assert!(requests[0].extra_body.is_empty());
+}
+
+fn glm_gateway(upstream: MockUpstream, model: &str) -> Arc<Gateway> {
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        model.to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_model: None,
+            system_prompt_prefix: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            reasoning_effort: Some(llmconduit::config::ReasoningConfig {
+                default: Some("none".to_string()),
+                map: std::collections::BTreeMap::from_iter([
+                    ("low".to_string(), "high".to_string()),
+                    ("medium".to_string(), "high".to_string()),
+                    ("xhigh".to_string(), "max".to_string()),
+                    ("minimal".to_string(), "none".to_string()),
+                ]),
+                ..Default::default()
+            }),
+            capabilities: None,
+        },
+    )]);
+    test_gateway_with_config(upstream, MockSearch::default(), config)
+}
+
+async fn post_messages(app: axum::Router, body: serde_json::Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+}
+
+#[tokio::test]
+async fn glm_profile_emits_max_effort_for_thinking_enabled() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = glm_gateway(upstream.clone(), "glm-5.2");
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.2",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "adaptive" },
+        "output_config": { "effort": "max" },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, body).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    // output_config.effort is the primary signal; "max" passes through the GLM map
+    // (unlisted) and is emitted top-level. Thinking-on is stated explicitly via the injected
+    // chat-template kwarg; no top-level `thinking` object is sent upstream.
+    assert!(requests[0].extra_body.get("thinking").is_none());
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("max"));
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(true))
+    );
+}
+
+#[tokio::test]
+async fn glm_profile_emits_none_effort_for_thinking_disabled() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = glm_gateway(upstream.clone(), "glm-5.2");
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.2",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "disabled" },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, body).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    // Thinking off is stated explicitly via the injected `enable_thinking: false` kwarg; the
+    // `default` knob still emits "none", but the upstream skip no longer relies on it.
+    assert!(requests[0].extra_body.get("thinking").is_none());
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("none"));
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(false))
+    );
+}
+
+#[tokio::test]
+async fn glm_profile_emits_none_effort_when_thinking_absent() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = glm_gateway(upstream.clone(), "glm-5.2");
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.2",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, body).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    // No thinking indicator at all -> off: explicit `enable_thinking: false` plus the GLM
+    // `default` effort "none".
+    assert!(requests[0].extra_body.get("thinking").is_none());
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("none"));
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(false))
+    );
+}
+
+#[tokio::test]
+async fn non_glm_profile_omits_thinking_object() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.1",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "enabled", "budget_tokens": 10000 },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, body).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].extra_body.get("thinking").is_none());
+    // No profile -> no effort shaping; thinking:enabled with no effort omits reasoning_effort.
+    // The thinking kwarg is still injected using the built-in default name/value.
+    assert_eq!(requests[0].reasoning_effort.as_deref(), None);
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(true))
+    );
+}
+
+#[tokio::test]
+async fn non_glm_profile_omits_reasoning_effort_when_thinking_absent() {
+    // Non-GLM contrast: thinking absent omits reasoning_effort (a GLM profile emits "none").
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.1",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, body).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].extra_body.get("thinking").is_none());
+    assert_eq!(requests[0].reasoning_effort.as_deref(), None);
+    // Thinking absent -> off, stated explicitly via the default `enable_thinking: false` kwarg.
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(false))
+    );
+}
+
+async fn assert_glm_output_config_effort(effort: &str, expected: &str) {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = glm_gateway(upstream.clone(), "glm-5.2");
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.2",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "adaptive" },
+        "output_config": { "effort": effort },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, body).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    // output_config.effort is the primary signal (CC's Opus path). Effort is clamped
+    // per z.ai and emitted top-level; thinking-on is stated via the injected kwarg, but a
+    // level that clamps to "none" disables thinking even though the request enabled it.
+    assert!(requests[0].extra_body.get("thinking").is_none());
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some(expected));
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(expected != "none"))
+    );
+}
+
+#[tokio::test]
+async fn glm_profile_output_config_effort_max_emits_max() {
+    assert_glm_output_config_effort("max", "max").await;
+}
+
+#[tokio::test]
+async fn glm_profile_output_config_effort_high_emits_high() {
+    assert_glm_output_config_effort("high", "high").await;
+}
+
+#[tokio::test]
+async fn glm_profile_output_config_effort_low_clamps_to_high() {
+    assert_glm_output_config_effort("low", "high").await;
+}
+
+#[tokio::test]
+async fn glm_profile_output_config_effort_xhigh_clamps_to_max() {
+    assert_glm_output_config_effort("xhigh", "max").await;
+}
+
+#[tokio::test]
+async fn glm_profile_output_config_effort_medium_clamps_to_high() {
+    assert_glm_output_config_effort("medium", "high").await;
+}
+
+#[tokio::test]
+async fn glm_profile_output_config_effort_none_emits_none() {
+    assert_glm_output_config_effort("none", "none").await;
+}
+
+#[tokio::test]
+async fn glm_profile_output_config_effort_minimal_emits_none() {
+    assert_glm_output_config_effort("minimal", "none").await;
+}
+
+#[tokio::test]
+async fn glm_profile_thinking_enabled_but_effort_none_disables_thinking() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = glm_gateway(upstream.clone(), "glm-5.2");
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.2",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "adaptive" },
+        "output_config": { "effort": "none" },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, body).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    // The request enabled thinking, but the effort resolves to "none" (z.ai's skip-thinking
+    // level), so the injected kwarg is forced off.
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("none"));
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(false))
+    );
+}
+
+fn gateway_with_profile(
+    upstream: MockUpstream,
+    model: &str,
+    profile: llmconduit::config::ModelProfile,
+) -> Arc<Gateway> {
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(model.to_string(), profile)]);
+    test_gateway_with_config(upstream, MockSearch::default(), config)
+}
+
+#[tokio::test]
+async fn chat_completions_path_does_not_inject_thinking_kwarg() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = glm_gateway(upstream.clone(), "glm-5.2");
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.2",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    // Chat Completions clients own the thinking kwarg; the gateway injects none even on a GLM
+    // profile (the `default` effort still applies as a top-level fallback).
+    assert!(requests[0].extra_body.get("chat_template_kwargs").is_none());
+}
+
+#[tokio::test]
+async fn chat_completions_path_passes_client_thinking_kwarg_through() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = glm_gateway(upstream.clone(), "glm-5.2");
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.2",
+        "stream": true,
+        "chat_template_kwargs": { "enable_thinking": true },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    // The client's own kwarg passes through untouched; the gateway does not override it.
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(true))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_thinking_injection_uses_custom_param_config() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "ok"))])
+        .await;
+    let profile = llmconduit::config::ModelProfile {
+        upstream_model: None,
+        system_prompt_prefix: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        reasoning_effort: Some(llmconduit::config::ReasoningConfig {
+            default: None,
+            map: std::collections::BTreeMap::new(),
+            thinking_param_name: "reasoning_mode".to_string(),
+            thinking_param_value_on: json!("deep"),
+            thinking_param_value_off: json!("off"),
+        }),
+        capabilities: None,
+    };
+    let gateway = gateway_with_profile(upstream.clone(), "custom-model", profile);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let enabled = serde_json::json!({
+        "model": "custom-model",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "enabled", "budget_tokens": 1024 },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app.clone(), enabled).await;
+
+    let disabled = serde_json::json!({
+        "model": "custom-model",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "disabled" },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, disabled).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2);
+    // The configured name and on/off values drive the injected kwarg.
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("reasoning_mode")),
+        Some(&json!("deep"))
+    );
+    assert_eq!(
+        requests[1]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("reasoning_mode")),
+        Some(&json!("off"))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_thinking_injection_overrides_static_chat_template_default() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let mut upstream_chat_kwargs = JsonMap::new();
+    upstream_chat_kwargs.insert(
+        "chat_template_kwargs".to_string(),
+        json!({ "enable_thinking": true }),
+    );
+    let profile = llmconduit::config::ModelProfile {
+        upstream_model: None,
+        system_prompt_prefix: None,
+        upstream_chat_kwargs,
+        reasoning_effort: None,
+        capabilities: None,
+    };
+    let gateway = gateway_with_profile(upstream.clone(), "custom-model", profile);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "custom-model",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "disabled" },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    post_messages(app, body).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    // The explicit thinking-off decision overrides the static `enable_thinking: true` default.
+    assert_eq!(
+        requests[0]
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking")),
+        Some(&json!(false))
+    );
+}
+
+#[tokio::test]
+async fn count_tokens_injects_thinking_kwarg() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .and(body_partial_json(json!({
+            "chat_template_kwargs": { "enable_thinking": true }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 42 })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-x",
+                        "thinking": { "type": "enabled", "budget_tokens": 1024 },
+                        "messages": [{ "role": "user", "content": "hi" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // A 200 means the `/tokenize` body matched the injected `enable_thinking: true` kwarg.
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(body, json!({ "input_tokens": 42 }));
 }
 
 #[tokio::test]
@@ -4741,7 +5426,10 @@ async fn anthropic_messages_forwards_output_config_as_response_format() {
             }
         }))
     );
-    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("max"));
+    // No thinking object was sent, so thinking is off; off wins over the stray
+    // output_config.effort and the Default profile omits the field. Effort is forwarded
+    // and clamped when thinking is on.
+    assert_eq!(requests[0].reasoning_effort.as_deref(), None);
     assert_eq!(requests[0].tools, None);
 }
 
@@ -4915,6 +5603,8 @@ async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
+            reasoning_effort: None,
+            capabilities: None,
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -5550,7 +6240,6 @@ async fn cancels_mid_stream_when_client_disconnects() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -5695,6 +6384,7 @@ async fn sse_responses_include_connection_keep_alive() {
         tool_choice: json!("auto"),
         parallel_tool_calls: true,
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
