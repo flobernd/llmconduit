@@ -124,6 +124,125 @@ values. In model profiles and templates, extra profile-level keys are shorthand
 for upstream chat kwargs; the explicit `upstream_chat_kwargs` wrapper still
 works and overrides the shorthand when both set the same key.
 
+### Reasoning effort
+
+A profile's `reasoning_effort` block shapes the upstream `reasoning_effort` field
+(the value Claude Code sends as `output_config.effort`, and the value OpenAI
+clients send as `reasoning_effort`) and controls the thinking template kwarg the
+gateway injects on the Anthropic route. It applies on every converting route
+(`/v1/messages`, `/v1/responses`, `/v1/chat/completions`, and
+`/v1/messages/count_tokens`).
+
+```yaml
+model_profiles:
+  default:
+    reasoning_effort:
+      default: high
+      map:
+        low: high
+        xhigh: max
+        "*": high
+      thinking_param_name: enable_thinking
+      thinking_param_value_on: true
+      thinking_param_value_off: false
+```
+
+- `map` translates a client effort level to an upstream effort string. Keys match
+  case-insensitively. A level that is not listed passes through verbatim, unless
+  the reserved `*` entry is set, which rewrites every otherwise-unlisted level. An
+  explicit level always wins over `*`.
+- `default` is the effort emitted when the client sends no effort string. `default:
+  null` (or omitting it) sends no `reasoning_effort` field. `*` does not apply to
+  this case.
+- Anthropic clients expect thinking to be **off** unless the request explicitly
+  enables it, but some upstreams treat an absent `enable_thinking` kwarg as thinking
+  *on*. So on the Anthropic route the gateway always injects a
+  thinking template kwarg into `chat_template_kwargs`, stating on/off explicitly
+  rather than leaving it to the upstream default or inferring it from the effort
+  value. `thinking_param_name` is the kwarg name (default `enable_thinking`);
+  `thinking_param_value_on` / `_off` are the values for thinking-on and thinking-off
+  (defaults `true` / `false`, but any JSON value is allowed). The injected value
+  overrides any static `chat_template_kwargs` default for that key, and a profile
+  with no `reasoning_effort` block still injects the built-in `enable_thinking:
+  true`/`false`.
+- A resolved effort of `none` also forces the off-value on the Anthropic route, even
+  when the request enabled thinking. This is what makes a `map` that clamps low levels
+  to `none` (e.g. z.ai's `minimal`/`none` -> `none`) actually skip thinking.
+- Chat Completions and native Responses clients control the thinking kwarg
+  themselves via `chat_template_kwargs` in the request; the gateway never injects
+  one for them.
+- A profile with no `reasoning_effort` block applies no effort shaping: the client
+  effort is forwarded if present, otherwise omitted (no clamp).
+
+The reserved `default` profile shapes models with no matching profile. Resolution
+is strict: the highest-precedence `reasoning_effort` block wins wholesale (no
+field-merging across `extends` or the request/configured/resolved chain), and a
+matched profile without a block is not back-filled from `default`.
+
+### Model capabilities
+
+A profile's `capabilities` block overrides the Anthropic model capabilities
+advertised on `/v1/models` for Anthropic clients.
+
+```yaml
+model_profiles:
+  default:
+    capabilities:
+      thinking:
+        types: [adaptive, enabled]
+      effort:
+        levels: [max, xhigh, high, medium, low, minimal, none]
+      image_input: false
+```
+
+- `supported` is the only knob and defaults to `true`. The simple caps (`batch`,
+  `citations`, `code_execution`, `image_input`, `pdf_input`,
+  `structured_outputs`) accept a bare bool as shorthand for `{supported: <bool>}`.
+- `thinking.types`, `effort.levels`, and `context_management.features` list the
+  advertised sub-entries; each inherits the cap's `supported` flag.
+- Unknown cap keys, effort levels, thinking types, and context-management features
+  are rejected at load.
+- A configured cap replaces the base (upstream-supplied, else the default
+  capabilities) for that cap key, wholesale; unconfigured caps keep the base.
+  Caps resolve per upstream id: an id-keyed profile, else the first alias whose
+  `upstream_model` targets the id, else the `default` profile.
+
+### Example: GLM-5.2 on vLLM
+
+On vLLM, GLM's `reasoning_effort` is a top-level field and `enable_thinking` is a
+chat-template kwarg. GLM treats an absent `enable_thinking` as thinking *on*, which
+contradicts Anthropic's default-off semantics when a client omits thinking, so the
+gateway injects `enable_thinking: true`/`false` on the Anthropic route to state it
+explicitly (the defaults already match GLM, so no `thinking_param_*` keys are
+needed). The `map` reproduces the z.ai clamp for the effort string, and a level that
+clamps to `none` also forces `enable_thinking: false` so the clamp actually skips
+thinking.
+
+GLM's allowed levels are `max` (default, deep reasoning), `xhigh`, `high`,
+`medium`, `low`, `minimal`, `none`. z.ai clamps them: `none`/`minimal` skip
+thinking, `low`/`medium` map to `high`, and `xhigh` maps to `max`. `high` and
+`max` are native levels, so they pass through unchanged and need no map entry.
+
+```yaml
+model_profiles:
+  GLM-5.2:
+    reasoning_effort:
+      map:
+        none: none
+        minimal: none
+        low: high
+        medium: high
+        xhigh: max
+    capabilities:
+      thinking:
+        types: [adaptive, enabled]
+      effort:
+        levels: [max, xhigh, high, medium, low, minimal, none]
+      structured_outputs: true
+      image_input: false
+      pdf_input: false
+```
+
 Optional Brave Search:
 
 ```yaml
