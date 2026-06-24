@@ -283,6 +283,8 @@ async fn profile_parallel_tool_calls_applies_when_client_omits_true() {
                 "parallel_tool_calls".to_string(),
                 json!(true),
             )]),
+            reasoning_effort: None,
+            capabilities: None,
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -4949,7 +4951,13 @@ async fn anthropic_messages_streams_nested_thinking_response() {
     // No profile matches this model, so the client effort passes through verbatim;
     // budget_tokens is ignored and output_config.effort "max" is forwarded as-is.
     assert_eq!(requests[0].reasoning_effort.as_deref(), Some("max"));
-    assert!(requests[0].extra_body.is_empty());
+    // No profile matches, so no profile kwargs apply; the only entry is the
+    // thinking kwarg the Anthropic route always injects so an upstream defaulting
+    // thinking on cannot override the client's explicit on/off decision.
+    assert_eq!(
+        serde_json::to_value(&requests[0].extra_body).expect("serialize extra_body"),
+        json!({ "chat_template_kwargs": { "enable_thinking": true } })
+    );
 }
 
 fn glm_gateway(upstream: MockUpstream, model: &str) -> Arc<Gateway> {
