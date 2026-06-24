@@ -107,6 +107,12 @@ model_profiles:
     chat_template_kwargs:
       clear_thinking: false
 
+  GLM-5.2:
+    extends:
+      - thinking
+    upstream_chat_kwargs:
+      parallel_tool_calls: true
+
   Kimi-K2.6:
     extends:
       - thinking
@@ -123,6 +129,13 @@ matched model profile templates, matched model profile, then explicit request
 values. In model profiles and templates, extra profile-level keys are shorthand
 for upstream chat kwargs; the explicit `upstream_chat_kwargs` wrapper still
 works and overrides the shorthand when both set the same key.
+
+`parallel_tool_calls` is a typed default: when a client omits it, the profile
+default applies, and an explicit client value always wins. The Anthropic
+(`/v1/messages`) route has no client field for it, so the profile default is the
+only way to control it there. Setting it to `true` (as on `GLM-5.2` above) lets
+Claude Code fan out independent tool calls in one turn; setting it to `false`
+forces sequential calls for a model that mishandles parallel tool use.
 
 Optional Brave Search:
 
