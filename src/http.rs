@@ -813,7 +813,7 @@ async fn handle_count_tokens(
     // then inject the thinking kwarg on top so it overrides any static default. Typed defaults
     // are folded into the named chat fields by the generation path and don't belong in the
     // tokenize body, so only the passthrough map is carried over here.
-    let (_, passthrough_kwargs) = crate::engine::extract_typed_defaults(
+    let passthrough_kwargs = crate::engine::extract_passthrough_kwargs(
         gateway
             .config()
             .resolve_upstream_chat_kwargs_for_resolved_model(&original_model, &resolved_model),

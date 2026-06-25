@@ -237,7 +237,16 @@ struct UpstreamTypedDefaults {
     parallel_tool_calls: Option<bool>,
 }
 
-pub(crate) fn extract_typed_defaults(
+/// Passthrough portion of `upstream_chat_kwargs` after typed defaults are extracted, for
+/// `/v1/messages/count_tokens` to mirror the generation path's `chat_template_kwargs` without
+/// exposing the typed-defaults struct.
+pub(crate) fn extract_passthrough_kwargs(
+    map: serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    extract_typed_defaults(map).1
+}
+
+fn extract_typed_defaults(
     mut map: serde_json::Map<String, Value>,
 ) -> (UpstreamTypedDefaults, serde_json::Map<String, Value>) {
     let mut defaults = UpstreamTypedDefaults::default();
