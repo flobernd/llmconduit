@@ -122,7 +122,50 @@ global prefix. `upstream_chat_kwargs` merge in this order: top-level defaults,
 matched model profile templates, matched model profile, then explicit request
 values. In model profiles and templates, extra profile-level keys are shorthand
 for upstream chat kwargs; the explicit `upstream_chat_kwargs` wrapper still
-works and overrides the shorthand when both set the same key.
+works and overrides the shorthand when both set the same key. When a profile
+`extends` multiple templates, the `extends` list is applied in declaration
+order: later entries override earlier ones, and the profile's own fields
+override all templates.
+
+### Reserved `*` profile
+
+A profile keyed `*` is a pure fallback for per-model settings. When a request
+names a model that no specific `model_profiles` entry matches, the `*` profile
+stands in as that model's profile: its `upstream_chat_kwargs` and
+`system_prompt_prefix` apply. When a specific profile DOES match, the `*`
+profile is not consulted at all - an explicit match never inherits unset fields
+from `*`. The `*` profile can itself `extend` templates, so extending a shared
+template is the way to give `*` and explicit profiles common defaults. Use
+`model_profile_templates` (`extends`) to share fields between explicit
+profiles, not `*`.
+
+Per-model profile matching precedence, highest to lowest:
+
+1. The request model - matched by name (case-insensitive) against `model_profiles`.
+2. The resolved/upstream model (after `upstream_model` rewriting) - matched by name.
+3. The reserved `*` profile - used only when neither 1 nor 2 matches.
+
+Top-level config is the base below all profiles: `upstream_chat_kwargs` is the
+deep-merge base, and `system_prompt_prefix` is always prepended. Client request
+values still override profile settings, as described above.
+
+```yaml
+model_profiles:
+  # Fallback for any model without an explicit profile.
+  "*":
+    upstream_chat_kwargs:
+      chat_template_kwargs:
+        enable_thinking: true
+
+  GLM-5.2:
+    upstream_chat_kwargs:
+      chat_template_kwargs:
+        enable_thinking: false
+```
+
+With this config, a request for `GLM-5.2` uses only the `GLM-5.2` profile
+(`enable_thinking: false`); the `*` profile contributes nothing. A request for
+any other model (e.g. `Qwen-3`) falls back to `*` (`enable_thinking: true`).
 
 Optional Brave Search:
 

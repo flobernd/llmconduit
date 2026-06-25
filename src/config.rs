@@ -24,6 +24,8 @@ pub struct Config {
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
+    /// Per-model profiles keyed by name (case-insensitive lookup). The name `"*"` is
+    /// reserved as the fallback profile for per-model settings that no specific profile covers.
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub brave_base_url: Url,
     pub brave_api_key: Option<String>,
@@ -89,7 +91,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
@@ -390,19 +392,30 @@ impl Config {
         )
     }
 
+    /// Collect profiles matching the request model chain. `resolved_model` must be
+    /// `resolve_upstream_model(request_model)` (callers pass the already-resolved upstream
+    /// id); it is not re-resolved here. The resolved/upstream model is tried first, then the
+    /// request model itself, with pointer-dedup to keep the precedence order stable. The
+    /// reserved `*` profile is a pure fallback: it is included only when no specific profile
+    /// matches, so an explicit match never inherits unset fields from `*` (use profile
+    /// templates to share fields between explicit profiles).
     fn model_profiles_for_resolved_model(
         &self,
         request_model: &str,
         resolved_model: &str,
     ) -> Vec<&ModelProfile> {
         let mut profiles: Vec<&ModelProfile> = Vec::new();
-        let configured_model = self.resolve_upstream_model(request_model);
-        for model in [resolved_model, configured_model.as_str(), request_model] {
+        for model in [resolved_model, request_model] {
             if let Some(profile) = self.model_profile(model)
                 && !profiles
                     .iter()
                     .any(|existing| std::ptr::eq(*existing, profile))
             {
+                profiles.push(profile);
+            }
+        }
+        if profiles.is_empty() {
+            if let Some(profile) = self.model_profile("*") {
                 profiles.push(profile);
             }
         }
@@ -1106,20 +1119,17 @@ mod tests {
             model_profile_templates: BTreeMap::from_iter([(
                 "streaming-reasoning".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
-                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "stream_reasoning".to_string(),
                         JsonValue::Bool(true),
                     )]),
+                    ..Default::default()
                 },
             )]),
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming-reasoning".to_string()],
-                    upstream_model: None,
                     system_prompt_prefix: Some("Use Kimi-compatible behavior.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
@@ -1128,6 +1138,7 @@ mod tests {
                             "preserve_thinking": true
                         }),
                     )]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1163,9 +1174,6 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
-                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
                         json!({
@@ -1173,6 +1181,7 @@ mod tests {
                             "preserve_thinking": true
                         }),
                     )]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1203,6 +1212,111 @@ mod tests {
     }
 
     #[test]
+    fn star_profile_provides_upstream_chat_kwargs_for_unmatched_model() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
+            system_prompt_prefix: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            upstreams: Vec::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
+            model_profile_templates: BTreeMap::new(),
+            model_profiles: BTreeMap::from_iter([(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream_chat_kwargs: JsonMap::from_iter([(
+                        "chat_template_kwargs".to_string(),
+                        json!({ "enable_thinking": true }),
+                    )]),
+                    ..Default::default()
+                },
+            )]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        // No specific profile matches; the reserved `*` profile supplies the kwargs.
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("unmatched-model"),
+            JsonMap::from_iter([(
+                "chat_template_kwargs".to_string(),
+                json!({ "enable_thinking": true }),
+            )])
+        );
+    }
+
+    #[test]
+    fn explicit_profile_match_does_not_inherit_star_upstream_chat_kwargs() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
+            system_prompt_prefix: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            upstreams: Vec::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
+            model_profile_templates: BTreeMap::new(),
+            model_profiles: BTreeMap::from_iter([
+                (
+                    "*".to_string(),
+                    PersistedModelProfile {
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "chat_template_kwargs".to_string(),
+                            json!({ "enable_thinking": true, "keep_all_reasoning": true }),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "glm-5.2".to_string(),
+                    PersistedModelProfile {
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "chat_template_kwargs".to_string(),
+                            json!({ "enable_thinking": false }),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        // An explicit match uses only that profile; the `*` profile does not fill in unset
+        // fields (keep_all_reasoning is absent even though `*` sets it).
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("glm-5.2"),
+            JsonMap::from_iter([(
+                "chat_template_kwargs".to_string(),
+                json!({ "enable_thinking": false }),
+            )])
+        );
+    }
+
+    #[test]
     fn resolves_model_profiles_case_insensitively() {
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
@@ -1220,7 +1334,6 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "MiMo-V2.5".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
                     upstream_model: Some("mimo-v2.5".to_string()),
                     system_prompt_prefix: Some("Prefer concise answers.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
@@ -1233,6 +1346,7 @@ mod tests {
                             }),
                         ),
                     ]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1280,8 +1394,6 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "xiaomi/mimo-v2.5-pro".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
                     system_prompt_prefix: Some("Use MiMo-compatible behavior.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "reasoning".to_string(),
@@ -1289,6 +1401,7 @@ mod tests {
                             "enabled": true
                         }),
                     )]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1342,8 +1455,6 @@ mod tests {
                 (
                     "xiaomi/mimo-v2.5-pro".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
-                        upstream_model: None,
                         system_prompt_prefix: Some("Backend prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "reasoning".to_string(),
@@ -1352,13 +1463,12 @@ mod tests {
                                 "effort": "medium"
                             }),
                         )]),
+                        ..Default::default()
                     },
                 ),
                 (
                     "client-default-model".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
-                        upstream_model: None,
                         system_prompt_prefix: Some("Client prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "reasoning".to_string(),
@@ -1366,6 +1476,7 @@ mod tests {
                                 "effort": "high"
                             }),
                         )]),
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -1417,25 +1528,25 @@ mod tests {
                 (
                     "MiMo-V2.5".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
                         upstream_model: Some("upper-profile".to_string()),
                         system_prompt_prefix: Some("Upper prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(true),
                         )]),
+                        ..Default::default()
                     },
                 ),
                 (
                     "mimo-v2.5".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
                         upstream_model: Some("lower-profile".to_string()),
                         system_prompt_prefix: Some("Lower prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(false),
                         )]),
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -1468,10 +1579,8 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
                     system_prompt_prefix: Some("Profile prefix.".to_string()),
-                    upstream_chat_kwargs: JsonMap::new(),
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -1497,8 +1606,6 @@ mod tests {
                 (
                     "reasoning".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
-                        upstream_model: None,
                         system_prompt_prefix: Some("Reasoning prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([
                             (
@@ -1518,14 +1625,13 @@ mod tests {
                                 }),
                             ),
                         ]),
+                        ..Default::default()
                     },
                 ),
                 (
                     "streaming".to_string(),
                     PersistedModelProfile {
                         extends: vec!["reasoning".to_string()],
-                        upstream_model: None,
-                        system_prompt_prefix: None,
                         upstream_chat_kwargs: JsonMap::from_iter([
                             ("stream_reasoning".to_string(), JsonValue::Bool(true)),
                             (
@@ -1543,6 +1649,7 @@ mod tests {
                                 }),
                             ),
                         ]),
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -1550,7 +1657,6 @@ mod tests {
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming".to_string()],
-                    upstream_model: None,
                     system_prompt_prefix: Some("Model prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
                         (
@@ -1569,6 +1675,7 @@ mod tests {
                             }),
                         ),
                     ]),
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -1657,9 +1764,7 @@ model_profiles:
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["missing".to_string()],
-                    upstream_model: None,
-                    system_prompt_prefix: None,
-                    upstream_chat_kwargs: JsonMap::new(),
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -1677,18 +1782,14 @@ model_profiles:
                     "a".to_string(),
                     PersistedModelProfile {
                         extends: vec!["b".to_string()],
-                        upstream_model: None,
-                        system_prompt_prefix: None,
-                        upstream_chat_kwargs: JsonMap::new(),
+                        ..Default::default()
                     },
                 ),
                 (
                     "b".to_string(),
                     PersistedModelProfile {
                         extends: vec!["a".to_string()],
-                        upstream_model: None,
-                        system_prompt_prefix: None,
-                        upstream_chat_kwargs: JsonMap::new(),
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -1696,9 +1797,7 @@ model_profiles:
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["a".to_string()],
-                    upstream_model: None,
-                    system_prompt_prefix: None,
-                    upstream_chat_kwargs: JsonMap::new(),
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -1827,10 +1926,8 @@ model_profiles:
             model_profiles: BTreeMap::from_iter([(
                 "anthropic/Kimi-K2.6".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
                     upstream_model: Some("anthropic-custom".to_string()),
-                    upstream_chat_kwargs: JsonMap::new(),
-                    system_prompt_prefix: None,
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
