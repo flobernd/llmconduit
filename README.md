@@ -114,6 +114,12 @@ model_profiles:
       Extra Kimi-specific instructions.
     chat_template_kwargs:
       preserve_thinking: true
+
+  GLM-5.2:
+    extends:
+      - thinking
+    upstream_chat_kwargs:
+      parallel_tool_calls: true
 ```
 
 `system_prompt_prefix` is prepended to all Responses, Chat Completions, and
@@ -166,6 +172,13 @@ model_profiles:
 With this config, a request for `GLM-5.2` uses only the `GLM-5.2` profile
 (`enable_thinking: false`); the `*` profile contributes nothing. A request for
 any other model (e.g. `Qwen-3`) falls back to `*` (`enable_thinking: true`).
+
+`parallel_tool_calls` is a typed default: when a client omits it, the profile
+default applies, and an explicit client value always wins. The Anthropic
+(`/v1/messages`) route has no client field for it, so the profile default is the
+only way to control it there. Setting it to `true` (as on `GLM-5.2` above) lets
+Claude Code fan out independent tool calls in one turn; setting it to `false`
+forces sequential calls for a model that mishandles parallel tool use.
 
 ### Model capabilities
 

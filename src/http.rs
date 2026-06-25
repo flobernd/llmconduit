@@ -798,10 +798,29 @@ async fn handle_count_tokens(
         Vec::new(),
         &gateway.config().default_reasoning_effort,
     )?;
-    let body = serde_json::json!({
-        "model": resolved_model,
-        "messages": lowered.messages,
-    });
+    // Mirror build_upstream_extra_body: start from the profile's resolved passthrough
+    // chat_template_kwargs (operator template kwargs affect rendering, so they must be counted).
+    // Typed defaults are folded into the named chat fields by the generation path and don't
+    // belong in the tokenize body, so only the passthrough map is carried over here.
+    let passthrough_kwargs = crate::engine::extract_passthrough_kwargs(
+        gateway
+            .config()
+            .resolve_upstream_chat_kwargs_for_resolved_model(&original_model, &resolved_model),
+    );
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), Value::String(resolved_model));
+    body.insert(
+        "messages".to_string(),
+        serde_json::to_value(&lowered.messages).unwrap_or(Value::Null),
+    );
+    if let Value::Object(map) = passthrough_kwargs
+        .get("chat_template_kwargs")
+        .cloned()
+        .unwrap_or(Value::Null)
+    {
+        body.insert("chat_template_kwargs".to_string(), Value::Object(map));
+    }
+    let body = Value::Object(body);
 
     match gateway.upstream_client().count_tokens(&body).await {
         Ok(Some(count)) => {
