@@ -35,7 +35,8 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
     );
     let input = converted_messages.input;
     let tools = convert_tools(&request.tools);
-    let (reasoning, mut extra_body) = convert_thinking(&request.thinking);
+    let reasoning = convert_thinking(&request.thinking);
+    let mut extra_body = BTreeMap::new();
     // Anthropic treats thinking as off unless the request enables it. Carry that explicit on/off
     // decision to the upstream-body builder, which injects the thinking template kwarg so an
     // upstream that defaults thinking on cannot override Anthropic's intent. Omitted/disabled is off.
@@ -191,7 +192,9 @@ fn apply_output_config_effort(
         }
         // Thinking-off wins over a contradictory effort signal: in real CC traffic
         // effort is always paired with thinking-on, so this only guards a malformed
-        // request. Returning None lets the chat layer emit the off-state effort.
+        // request. Returning None lets the chat layer emit the profile's
+        // `reasoning_effort.default` (a real level like "high"); with no profile it
+        // emits nothing.
         (None, Some(_)) => None,
         (reasoning, None) => reasoning,
     }
@@ -213,20 +216,18 @@ fn extract_system_text(system: &Option<AnthropicSystemContent>) -> String {
     }
 }
 
-fn convert_thinking(
-    thinking: &Option<AnthropicThinking>,
-) -> (Option<ReasoningRequest>, BTreeMap<String, Value>) {
+fn convert_thinking(thinking: &Option<AnthropicThinking>) -> Option<ReasoningRequest> {
     match thinking {
-        None | Some(AnthropicThinking::Disabled) => (None, BTreeMap::new()),
+        None | Some(AnthropicThinking::Disabled) => None,
         // `budget_tokens` is ignored: vLLM cannot limit the thinking budget, and CC
-        // carries effort in `output_config.effort` (applied below), not the budget.
-        Some(AnthropicThinking::Enabled { .. } | AnthropicThinking::Adaptive { .. }) => (
+        // carries effort in `output_config.effort`, applied by
+        // `apply_output_config_effort` after this returns, not the budget.
+        Some(AnthropicThinking::Enabled { .. } | AnthropicThinking::Adaptive { .. }) => {
             Some(ReasoningRequest {
                 effort: None,
                 summary: None,
-            }),
-            BTreeMap::new(),
-        ),
+            })
+        }
     }
 }
 

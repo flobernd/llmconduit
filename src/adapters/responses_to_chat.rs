@@ -329,6 +329,10 @@ pub fn lower_request_with_reasoning_config(
     // effort value.
     let reasoning_effort = match (request.reasoning.as_ref(), reasoning_config) {
         (None, None) => None,
+        // Anthropic route: `thinking: Disabled` lands here. The profile default
+        // (e.g. "high") is carried as the effort field, but thinking is off - the
+        // upstream honors the `enable_thinking` template kwarg over the effort
+        // field (vLLM does), so thinking stays off despite the carried default.
         (None, Some(rc)) => rc.default.clone(),
         (Some(reasoning), None) => reasoning
             .effort
@@ -342,6 +346,9 @@ pub fn lower_request_with_reasoning_config(
             .filter(|value| !value.is_empty())
         {
             // Exact level wins; then the `*` catch-all; then verbatim passthrough.
+            // A listed level is matched case-insensitively (lowercased first); an
+            // unlisted level falls through verbatim in the client's original case,
+            // so callers must not assume the result is lowercase.
             Some(effort) => Some(
                 rc.map
                     .get(&effort.to_ascii_lowercase())

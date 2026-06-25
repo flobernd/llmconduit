@@ -386,6 +386,9 @@ impl AnthropicStreamConverter {
         let (stop_reason, stop_sequence) = if let Some(reason) = response_stop_reason(data) {
             (reason, None)
         } else if self.has_tool_calls {
+            // Anthropic stop_reason precedence is tool_use > stop_sequence >
+            // end_turn: a turn with both tool calls and a matched stop string
+            // reports tool_use, so `stop_sequence` is dropped here.
             ("tool_use".to_string(), None)
         } else if let Some(stop) = response_stop_sequence(data) {
             ("stop_sequence".to_string(), Some(Value::String(stop)))
