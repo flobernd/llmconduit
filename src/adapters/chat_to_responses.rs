@@ -58,7 +58,6 @@ pub struct FinalizedAssistantTurn {
     pub reasoning_part_emitted: bool,
     pub refusal_text: String,
     pub finish_reason: Option<String>,
-    pub stop_sequence: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -73,7 +72,6 @@ pub struct StreamState {
     reasoning_part_emitted: bool,
     refusal_text: String,
     finish_reason: Option<String>,
-    stop_sequence: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -173,14 +171,6 @@ impl StreamState {
             }
             if let Some(reason) = &choice.finish_reason {
                 self.finish_reason = Some(reason.clone());
-            }
-            // vLLM's `stop_reason` carries the matched stop token: a string when
-            // a stop string fired, an integer token id (incl. EOS) otherwise.
-            // Only a string is a real stop-sequence match we can surface.
-            if let Some(Value::String(stop)) = &choice.stop_reason {
-                if !stop.is_empty() {
-                    self.stop_sequence = Some(stop.clone());
-                }
             }
             if let Some(tool_calls) = &choice.delta.tool_calls {
                 for tool_call in tool_calls {
@@ -406,7 +396,6 @@ impl StreamState {
             reasoning_part_emitted: self.reasoning_part_emitted,
             refusal_text: self.refusal_text,
             finish_reason: self.finish_reason,
-            stop_sequence: self.stop_sequence,
         })
     }
 }
@@ -527,7 +516,6 @@ mod tests {
                     extra: Default::default(),
                 },
                 finish_reason: None,
-                stop_reason: None,
             }],
             usage: None,
         }
@@ -547,7 +535,6 @@ mod tests {
                     extra: Default::default(),
                 },
                 finish_reason: None,
-                stop_reason: None,
             }],
             usage: None,
         }
@@ -581,7 +568,6 @@ mod tests {
                     extra: Default::default(),
                 },
                 finish_reason: None,
-                stop_reason: None,
             }],
             usage: None,
         }
@@ -608,7 +594,6 @@ mod tests {
                     extra: Default::default(),
                 },
                 finish_reason: None,
-                stop_reason: None,
             }],
             usage: None,
         }
@@ -1043,7 +1028,6 @@ mod tests {
                     )]),
                 },
                 finish_reason: None,
-                stop_reason: None,
             }],
             usage: None,
         };
@@ -1079,7 +1063,6 @@ mod tests {
                     )]),
                 },
                 finish_reason: None,
-                stop_reason: None,
             }],
             usage: None,
         };
@@ -1129,7 +1112,6 @@ mod tests {
                     extra: Default::default(),
                 },
                 finish_reason: None,
-                stop_reason: None,
             }],
             usage: None,
         };
@@ -1155,7 +1137,6 @@ mod tests {
                     extra: Default::default(),
                 },
                 finish_reason: Some("length".to_string()),
-                stop_reason: None,
             }],
             usage: None,
         };
@@ -1163,58 +1144,6 @@ mod tests {
         let registry = simple_registry(vec![]);
         let finalized = state.finalize(&registry).unwrap();
         assert_eq!(finalized.finish_reason, Some("length".to_string()));
-    }
-
-    #[test]
-    fn test_stop_sequence_captured_from_string_stop_reason() {
-        let mut state = StreamState::default();
-        let chunk = ChatCompletionChunk {
-            id: "c1".to_string(),
-            choices: vec![ChatChunkChoice {
-                index: 0,
-                delta: ChatDelta {
-                    content: Some("hi".to_string()),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    function_call: None,
-                    refusal: None,
-                    extra: Default::default(),
-                },
-                finish_reason: Some("stop".to_string()),
-                stop_reason: Some(serde_json::json!("</block>")),
-            }],
-            usage: None,
-        };
-        state.apply_chunk(&chunk);
-        let registry = simple_registry(vec![]);
-        let finalized = state.finalize(&registry).unwrap();
-        assert_eq!(finalized.stop_sequence, Some("</block>".to_string()));
-    }
-
-    #[test]
-    fn test_integer_stop_reason_does_not_become_stop_sequence() {
-        let mut state = StreamState::default();
-        let chunk = ChatCompletionChunk {
-            id: "c1".to_string(),
-            choices: vec![ChatChunkChoice {
-                index: 0,
-                delta: ChatDelta {
-                    content: Some("hi".to_string()),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    function_call: None,
-                    refusal: None,
-                    extra: Default::default(),
-                },
-                finish_reason: Some("stop".to_string()),
-                stop_reason: Some(serde_json::json!(163586)),
-            }],
-            usage: None,
-        };
-        state.apply_chunk(&chunk);
-        let registry = simple_registry(vec![]);
-        let finalized = state.finalize(&registry).unwrap();
-        assert_eq!(finalized.stop_sequence, None);
     }
 
     #[test]

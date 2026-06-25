@@ -11,19 +11,154 @@ use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
+/// Per-profile reasoning-effort shaping (config key `reasoning_effort`). `map` translates
+/// client effort levels to upstream effort strings; an unlisted level is rewritten by the
+/// reserved `*` catch-all entry if present, otherwise passes through verbatim. `default` is
+/// the effort emitted when the client sends no effort string. Thinking on/off is not carried
+/// by the effort value: Anthropic treats thinking as off unless the request enables it, but some
+/// upstreams default it on when the kwarg is absent, so on the Anthropic path the gateway always
+/// injects an explicit thinking template kwarg (`thinking_param_name`, default `enable_thinking`)
+/// set to `thinking_param_value_on`/`_off`. A `default` effort that leaks through while thinking
+/// is off is then ignored by the upstream. The `*` rewrite is applied in
+/// `adapters::responses_to_chat::lower_request_with_reasoning_config`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub map: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "is_default_thinking_param_name")]
+    pub thinking_param_name: String,
+    #[serde(skip_serializing_if = "is_default_thinking_param_value_on")]
+    pub thinking_param_value_on: JsonValue,
+    #[serde(skip_serializing_if = "is_default_thinking_param_value_off")]
+    pub thinking_param_value_off: JsonValue,
+}
+
+const DEFAULT_THINKING_PARAM_NAME: &str = "enable_thinking";
+
+fn default_thinking_param_name() -> String {
+    DEFAULT_THINKING_PARAM_NAME.to_string()
+}
+
+fn default_thinking_param_value_on() -> JsonValue {
+    JsonValue::Bool(true)
+}
+
+fn default_thinking_param_value_off() -> JsonValue {
+    JsonValue::Bool(false)
+}
+
+// Omit the thinking-param knobs from serialized config when they hold their defaults, so a
+// written config stays as terse as the input the user provided.
+fn is_default_thinking_param_name(name: &str) -> bool {
+    name == DEFAULT_THINKING_PARAM_NAME
+}
+
+fn is_default_thinking_param_value_on(value: &JsonValue) -> bool {
+    matches!(value, JsonValue::Bool(true))
+}
+
+fn is_default_thinking_param_value_off(value: &JsonValue) -> bool {
+    matches!(value, JsonValue::Bool(false))
+}
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            default: None,
+            map: BTreeMap::new(),
+            thinking_param_name: default_thinking_param_name(),
+            thinking_param_value_on: default_thinking_param_value_on(),
+            thinking_param_value_off: default_thinking_param_value_off(),
+        }
+    }
+}
+
+impl ReasoningConfig {
+    /// Value to inject for the thinking template kwarg given the request's thinking state.
+    pub fn thinking_param_value(&self, on: bool) -> &JsonValue {
+        if on {
+            &self.thinking_param_value_on
+        } else {
+            &self.thinking_param_value_off
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default)]
+            default: Option<String>,
+            #[serde(default)]
+            map: BTreeMap<String, String>,
+            #[serde(default = "default_thinking_param_name")]
+            thinking_param_name: String,
+            #[serde(default = "default_thinking_param_value_on")]
+            thinking_param_value_on: JsonValue,
+            #[serde(default = "default_thinking_param_value_off")]
+            thinking_param_value_off: JsonValue,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        // Lowercase keys for case-insensitive lookup; trim and drop empties so a stray
+        // whitespace entry cannot produce an empty upstream effort. Values are forwarded
+        // verbatim (upstream effort is backend-specific, not a known enum here).
+        let map = raw
+            .map
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim().to_string();
+                if key.is_empty() || value.is_empty() {
+                    None
+                } else {
+                    Some((key, value))
+                }
+            })
+            .collect();
+        let default = raw.default.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        });
+        // An empty/whitespace name would inject a nameless kwarg; fall back to the default.
+        let thinking_param_name = {
+            let trimmed = raw.thinking_param_name.trim();
+            if trimmed.is_empty() {
+                default_thinking_param_name()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        Ok(ReasoningConfig {
+            default,
+            map,
+            thinking_param_name,
+            thinking_param_value_on: raw.thinking_param_value_on,
+            thinking_param_value_off: raw.thinking_param_value_off,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub upstream_base_url: Url,
     pub upstream_api_key: Option<String>,
     pub upstream_model: Option<String>,
-    pub default_reasoning_effort: String,
     pub system_prompt_prefix: Option<String>,
     pub upstream_request_log_path: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
+    /// Per-model profiles keyed by name (case-insensitive lookup). The name `"*"` is
+    /// reserved as the fallback profile for per-model settings that no specific profile covers.
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub brave_base_url: Url,
     pub brave_api_key: Option<String>,
@@ -56,6 +191,8 @@ pub struct PersistedModelProfile {
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningConfig>,
 }
 
 impl<'de> Deserialize<'de> for PersistedModelProfile {
@@ -75,6 +212,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default, flatten)]
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
+            #[serde(default)]
+            reasoning_effort: Option<ReasoningConfig>,
         }
 
         let raw = RawPersistedModelProfile::deserialize(deserializer)?;
@@ -85,15 +224,17 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             upstream_model: raw.upstream_model,
             system_prompt_prefix: raw.system_prompt_prefix,
             upstream_chat_kwargs,
+            reasoning_effort: raw.reasoning_effort,
         })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    pub reasoning_effort: Option<ReasoningConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,8 +292,11 @@ pub struct PersistedConfig {
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
-    #[serde(default = "default_reasoning_effort")]
-    pub default_reasoning_effort: String,
+    // Migration guard: reject stray top-level `default_reasoning_effort` so old configs fail
+    // fast; route default effort through the reserved `*` profile's
+    // `reasoning_effort.default` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,10 +339,6 @@ fn default_upstream_base_url() -> String {
     "http://127.0.0.1:8000/v1".to_string()
 }
 
-pub fn default_reasoning_effort() -> String {
-    "max".to_string()
-}
-
 fn default_brave_base_url() -> String {
     "https://api.search.brave.com/res/v1".to_string()
 }
@@ -238,7 +378,7 @@ impl Default for PersistedConfig {
             upstream_base_url: default_upstream_base_url(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -283,8 +423,22 @@ impl Config {
             .map_err(|err| format!("invalid upstream_base_url: {err}"))?;
         let brave_base_url = Url::parse(&config.brave_base_url)
             .map_err(|err| format!("invalid brave_base_url: {err}"))?;
-        let default_reasoning_effort =
-            normalize_default_reasoning_effort(&config.default_reasoning_effort);
+        if config.default_reasoning_effort.is_some() {
+            return Err(
+                "`default_reasoning_effort` was removed; set `reasoning_effort.default` on the \
+                 reserved `*` model profile instead"
+                    .to_string(),
+            );
+        }
+        if let Ok(value) = env::var("LLMCONDUIT_DEFAULT_REASONING_EFFORT")
+            && !value.trim().is_empty()
+        {
+            return Err(
+                "`LLMCONDUIT_DEFAULT_REASONING_EFFORT` was removed; set `reasoning_effort.default` \
+                 on the reserved `*` model profile instead"
+                    .to_string(),
+            );
+        }
         let fallback_upstreams = config
             .fallback_upstreams
             .iter()
@@ -312,7 +466,6 @@ impl Config {
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            default_reasoning_effort,
             system_prompt_prefix: config
                 .system_prompt_prefix
                 .as_ref()
@@ -390,19 +543,44 @@ impl Config {
         )
     }
 
+    /// Resolve the reasoning shaping for a request model. If any profile matches the
+    /// model (request/resolved chain), the first `reasoning_effort` block in
+    /// highest-precedence order wins, wholesale; a matching profile without a
+    /// `reasoning_effort` block yields `None` (no fill-in from `*`). If no profile
+    /// matches, the reserved `*` profile's `reasoning_effort` block is used (also `None`
+    /// if absent). The `*` fallback is provided by `model_profiles_for_resolved_model`.
+    pub fn resolve_reasoning_config(&self, request_model: &str) -> Option<&ReasoningConfig> {
+        let upstream_model = self.resolve_upstream_model(request_model);
+        self.model_profiles_for_resolved_model(request_model, &upstream_model)
+            .into_iter()
+            .rev()
+            .find_map(|p| p.reasoning_effort.as_ref())
+    }
+
+    /// Collect profiles matching the request model chain. `resolved_model` must be
+    /// `resolve_upstream_model(request_model)` (callers pass the already-resolved upstream
+    /// id); it is not re-resolved here. The resolved/upstream model is tried first, then the
+    /// request model itself, with pointer-dedup to keep the precedence order stable. The
+    /// reserved `*` profile is a pure fallback: it is included only when no specific profile
+    /// matches, so an explicit match never inherits unset fields from `*` (use profile
+    /// templates to share fields between explicit profiles).
     fn model_profiles_for_resolved_model(
         &self,
         request_model: &str,
         resolved_model: &str,
     ) -> Vec<&ModelProfile> {
         let mut profiles: Vec<&ModelProfile> = Vec::new();
-        let configured_model = self.resolve_upstream_model(request_model);
-        for model in [resolved_model, configured_model.as_str(), request_model] {
+        for model in [resolved_model, request_model] {
             if let Some(profile) = self.model_profile(model)
                 && !profiles
                     .iter()
                     .any(|existing| std::ptr::eq(*existing, profile))
             {
+                profiles.push(profile);
+            }
+        }
+        if profiles.is_empty() {
+            if let Some(profile) = self.model_profile("*") {
                 profiles.push(profile);
             }
         }
@@ -419,18 +597,12 @@ impl Config {
     }
 }
 
-fn normalize_default_reasoning_effort(effort: &str) -> String {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "max" | "xhigh" => "max".to_string(),
-        _ => "high".to_string(),
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 struct ResolvedModelProfile {
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    reasoning_effort: Option<ReasoningConfig>,
 }
 
 impl ResolvedModelProfile {
@@ -439,6 +611,7 @@ impl ResolvedModelProfile {
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
             upstream_chat_kwargs: self.upstream_chat_kwargs,
+            reasoning_effort: self.reasoning_effort,
         }
     }
 }
@@ -494,12 +667,20 @@ fn resolve_persisted_model_profile(
     Ok(resolved)
 }
 
+/// Merge a resolved template (`source`) into the accumulating `destination`. Blocks
+/// (`reasoning_effort`) override wholesale: a child re-specifies a block to
+/// replace the inherited one; omitting it (or writing `null`) does NOT clear an inherited
+/// block - there is no opt-out, only override. Applies to `merge_persisted_model_profile`
+/// below as well.
 fn merge_resolved_model_profile(
     destination: &mut ResolvedModelProfile,
     source: ResolvedModelProfile,
 ) {
     if source.upstream_model.is_some() {
         destination.upstream_model = source.upstream_model;
+    }
+    if source.reasoning_effort.is_some() {
+        destination.reasoning_effort = source.reasoning_effort;
     }
     destination
         .system_prompt_prefixes
@@ -521,6 +702,9 @@ fn merge_persisted_model_profile(
         destination
             .system_prompt_prefixes
             .push(system_prompt_prefix);
+    }
+    if source.reasoning_effort.is_some() {
+        destination.reasoning_effort = source.reasoning_effort.clone();
     }
     merge_json_maps(
         &mut destination.upstream_chat_kwargs,
@@ -681,11 +865,6 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.upstream_model = Some(value);
     }
-    if let Ok(value) = env::var("LLMCONDUIT_DEFAULT_REASONING_EFFORT")
-        && !value.trim().is_empty()
-    {
-        config.default_reasoning_effort = value;
-    }
     if let Ok(value) = env::var("LLMCONDUIT_SYSTEM_PROMPT_PREFIX")
         && !value.trim().is_empty()
     {
@@ -774,9 +953,9 @@ mod tests {
     use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
+    use super::ReasoningConfig;
     use super::apply_env_overrides;
     use super::default_config_path;
-    use super::default_reasoning_effort;
     use super::load_persisted_config;
     use super::merge_json_maps;
     use super::write_persisted_config;
@@ -837,23 +1016,20 @@ mod tests {
     }
 
     #[test]
-    fn default_reasoning_effort_defaults_to_max_and_normalizes_to_two_levels() {
-        let result = Config::from_persisted(&PersistedConfig::default()).unwrap();
-        assert_eq!(result.default_reasoning_effort, "max");
-
-        let high_config = PersistedConfig {
-            default_reasoning_effort: " low ".to_string(),
+    fn default_reasoning_effort_is_rejected_with_migration_error() {
+        let config = PersistedConfig {
+            default_reasoning_effort: Some(json!("max")),
             ..PersistedConfig::default()
         };
-        let result = Config::from_persisted(&high_config).unwrap();
-        assert_eq!(result.default_reasoning_effort, "high");
-
-        let max_config = PersistedConfig {
-            default_reasoning_effort: " xhigh ".to_string(),
-            ..PersistedConfig::default()
-        };
-        let result = Config::from_persisted(&max_config).unwrap();
-        assert_eq!(result.default_reasoning_effort, "max");
+        let err = Config::from_persisted(&config).unwrap_err();
+        assert!(
+            err.contains("default_reasoning_effort"),
+            "error should name the removed knob: {err}"
+        );
+        assert!(
+            err.contains("reasoning_effort.default"),
+            "error should name the replacement: {err}"
+        );
     }
 
     #[test]
@@ -1093,7 +1269,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: Some("upstream-secret".to_string()),
             upstream_model: Some("grok-4".to_string()),
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: Some("Global prefix.".to_string()),
             upstream_request_log_path: Some("/tmp/llmconduit-upstream.jsonl".to_string()),
             upstream_chat_kwargs: JsonMap::from_iter([(
@@ -1106,20 +1282,17 @@ mod tests {
             model_profile_templates: BTreeMap::from_iter([(
                 "streaming-reasoning".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
-                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "stream_reasoning".to_string(),
                         JsonValue::Bool(true),
                     )]),
+                    ..Default::default()
                 },
             )]),
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming-reasoning".to_string()],
-                    upstream_model: None,
                     system_prompt_prefix: Some("Use Kimi-compatible behavior.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
@@ -1128,6 +1301,7 @@ mod tests {
                             "preserve_thinking": true
                         }),
                     )]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1152,7 +1326,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1163,9 +1337,6 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
-                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
                         json!({
@@ -1173,6 +1344,7 @@ mod tests {
                             "preserve_thinking": true
                         }),
                     )]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1203,13 +1375,118 @@ mod tests {
     }
 
     #[test]
+    fn star_profile_provides_upstream_chat_kwargs_for_unmatched_model() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            default_reasoning_effort: None,
+            system_prompt_prefix: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            upstreams: Vec::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
+            model_profile_templates: BTreeMap::new(),
+            model_profiles: BTreeMap::from_iter([(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream_chat_kwargs: JsonMap::from_iter([(
+                        "chat_template_kwargs".to_string(),
+                        json!({ "enable_thinking": true }),
+                    )]),
+                    ..Default::default()
+                },
+            )]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        // No specific profile matches; the reserved `*` profile supplies the kwargs.
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("unmatched-model"),
+            JsonMap::from_iter([(
+                "chat_template_kwargs".to_string(),
+                json!({ "enable_thinking": true }),
+            )])
+        );
+    }
+
+    #[test]
+    fn explicit_profile_match_does_not_inherit_star_upstream_chat_kwargs() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            default_reasoning_effort: None,
+            system_prompt_prefix: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            upstreams: Vec::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
+            model_profile_templates: BTreeMap::new(),
+            model_profiles: BTreeMap::from_iter([
+                (
+                    "*".to_string(),
+                    PersistedModelProfile {
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "chat_template_kwargs".to_string(),
+                            json!({ "enable_thinking": true, "keep_all_reasoning": true }),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "glm-5.2".to_string(),
+                    PersistedModelProfile {
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "chat_template_kwargs".to_string(),
+                            json!({ "enable_thinking": false }),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        // An explicit match uses only that profile; the `*` profile does not fill in unset
+        // fields (keep_all_reasoning is absent even though `*` sets it).
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("glm-5.2"),
+            JsonMap::from_iter([(
+                "chat_template_kwargs".to_string(),
+                json!({ "enable_thinking": false }),
+            )])
+        );
+    }
+
+    #[test]
     fn resolves_model_profiles_case_insensitively() {
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1220,7 +1497,6 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "MiMo-V2.5".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
                     upstream_model: Some("mimo-v2.5".to_string()),
                     system_prompt_prefix: Some("Prefer concise answers.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
@@ -1233,6 +1509,7 @@ mod tests {
                             }),
                         ),
                     ]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1269,7 +1546,7 @@ mod tests {
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1280,8 +1557,6 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "xiaomi/mimo-v2.5-pro".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
                     system_prompt_prefix: Some("Use MiMo-compatible behavior.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "reasoning".to_string(),
@@ -1289,6 +1564,7 @@ mod tests {
                             "enabled": true
                         }),
                     )]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1330,7 +1606,7 @@ mod tests {
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1342,8 +1618,6 @@ mod tests {
                 (
                     "xiaomi/mimo-v2.5-pro".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
-                        upstream_model: None,
                         system_prompt_prefix: Some("Backend prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "reasoning".to_string(),
@@ -1352,13 +1626,12 @@ mod tests {
                                 "effort": "medium"
                             }),
                         )]),
+                        ..Default::default()
                     },
                 ),
                 (
                     "client-default-model".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
-                        upstream_model: None,
                         system_prompt_prefix: Some("Client prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "reasoning".to_string(),
@@ -1366,6 +1639,7 @@ mod tests {
                                 "effort": "high"
                             }),
                         )]),
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -1405,7 +1679,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1417,25 +1691,25 @@ mod tests {
                 (
                     "MiMo-V2.5".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
                         upstream_model: Some("upper-profile".to_string()),
                         system_prompt_prefix: Some("Upper prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(true),
                         )]),
+                        ..Default::default()
                     },
                 ),
                 (
                     "mimo-v2.5".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
                         upstream_model: Some("lower-profile".to_string()),
                         system_prompt_prefix: Some("Lower prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(false),
                         )]),
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -1468,10 +1742,8 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
                     system_prompt_prefix: Some("Profile prefix.".to_string()),
-                    upstream_chat_kwargs: JsonMap::new(),
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -1497,8 +1769,6 @@ mod tests {
                 (
                     "reasoning".to_string(),
                     PersistedModelProfile {
-                        extends: Vec::new(),
-                        upstream_model: None,
                         system_prompt_prefix: Some("Reasoning prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([
                             (
@@ -1518,14 +1788,13 @@ mod tests {
                                 }),
                             ),
                         ]),
+                        ..Default::default()
                     },
                 ),
                 (
                     "streaming".to_string(),
                     PersistedModelProfile {
                         extends: vec!["reasoning".to_string()],
-                        upstream_model: None,
-                        system_prompt_prefix: None,
                         upstream_chat_kwargs: JsonMap::from_iter([
                             ("stream_reasoning".to_string(), JsonValue::Bool(true)),
                             (
@@ -1543,6 +1812,7 @@ mod tests {
                                 }),
                             ),
                         ]),
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -1550,7 +1820,6 @@ mod tests {
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming".to_string()],
-                    upstream_model: None,
                     system_prompt_prefix: Some("Model prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
                         (
@@ -1569,6 +1838,7 @@ mod tests {
                             }),
                         ),
                     ]),
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -1657,9 +1927,7 @@ model_profiles:
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["missing".to_string()],
-                    upstream_model: None,
-                    system_prompt_prefix: None,
-                    upstream_chat_kwargs: JsonMap::new(),
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -1677,18 +1945,14 @@ model_profiles:
                     "a".to_string(),
                     PersistedModelProfile {
                         extends: vec!["b".to_string()],
-                        upstream_model: None,
-                        system_prompt_prefix: None,
-                        upstream_chat_kwargs: JsonMap::new(),
+                        ..Default::default()
                     },
                 ),
                 (
                     "b".to_string(),
                     PersistedModelProfile {
                         extends: vec!["a".to_string()],
-                        upstream_model: None,
-                        system_prompt_prefix: None,
-                        upstream_chat_kwargs: JsonMap::new(),
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -1696,9 +1960,7 @@ model_profiles:
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["a".to_string()],
-                    upstream_model: None,
-                    system_prompt_prefix: None,
-                    upstream_chat_kwargs: JsonMap::new(),
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -1779,7 +2041,7 @@ model_profiles:
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1816,7 +2078,7 @@ model_profiles:
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1827,10 +2089,8 @@ model_profiles:
             model_profiles: BTreeMap::from_iter([(
                 "anthropic/Kimi-K2.6".to_string(),
                 PersistedModelProfile {
-                    extends: Vec::new(),
                     upstream_model: Some("anthropic-custom".to_string()),
-                    upstream_chat_kwargs: JsonMap::new(),
-                    system_prompt_prefix: None,
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1848,5 +2108,138 @@ model_profiles:
             config.resolve_upstream_model("anthropic/Kimi-K2.6"),
             "anthropic-custom"
         );
+    }
+
+    #[test]
+    fn reasoning_config_lowercases_map_keys_and_preserves_values() {
+        let rc: ReasoningConfig =
+            serde_json::from_value(json!({"map": {"Low": "High"}, "default": "none"}))
+                .expect("parse");
+        assert_eq!(rc.map.get("low"), Some(&"High".to_string()));
+        assert_eq!(rc.default.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn reasoning_config_drops_empty_entries() {
+        let rc: ReasoningConfig =
+            serde_json::from_value(json!({"map": {"": "high", "low": "   "}, "default": "  "}))
+                .expect("parse");
+        assert!(rc.map.is_empty());
+        assert_eq!(rc.default, None);
+    }
+
+    #[test]
+    fn reasoning_config_rejects_unknown_keys() {
+        let err = serde_json::from_value::<ReasoningConfig>(json!({"bogus": 1}));
+        assert!(err.is_err());
+    }
+
+    fn persisted_with_profiles(profiles: serde_json::Value) -> Config {
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "upstream_base_url".to_string(),
+            json!("http://127.0.0.1:8000/v1"),
+        );
+        if let serde_json::Value::Object(map) = profiles {
+            for (key, value) in map {
+                root.insert(key, value);
+            }
+        }
+        let persisted: PersistedConfig =
+            serde_json::from_value(serde_json::Value::Object(root)).expect("parse config");
+        Config::from_persisted(&persisted).expect("config")
+    }
+
+    fn config_with_profiles(profiles: BTreeMap<String, PersistedModelProfile>) -> Config {
+        Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
+            model_profiles: profiles,
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+            ..PersistedConfig::default()
+        })
+        .expect("config")
+    }
+
+    #[test]
+    fn extends_inherits_reasoning_block_wholesale() {
+        let config = persisted_with_profiles(json!({
+            "model_profile_templates": {"glm-base": {"reasoning_effort": {"default": "none", "map": {"low": "high"}}}},
+            "model_profiles": {"glm-5.2": {"extends": ["glm-base"]}}
+        }));
+        let rc = config
+            .resolve_reasoning_config("glm-5.2")
+            .expect("reasoning");
+        assert_eq!(rc.default.as_deref(), Some("none"));
+        assert_eq!(rc.map.get("low"), Some(&"high".to_string()));
+    }
+
+    #[test]
+    fn extends_overrides_reasoning_block_wholesale() {
+        // Child re-specifies reasoning; the parent's block is replaced entirely, not merged.
+        let config = persisted_with_profiles(json!({
+            "model_profile_templates": {"glm-base": {"reasoning_effort": {"default": "none", "map": {"low": "high", "medium": "high"}}}},
+            "model_profiles": {"glm-5.2": {"extends": ["glm-base"], "reasoning_effort": {"default": "max"}}}
+        }));
+        let rc = config
+            .resolve_reasoning_config("glm-5.2")
+            .expect("reasoning");
+        assert_eq!(rc.default.as_deref(), Some("max"));
+        assert!(rc.map.is_empty());
+    }
+
+    #[test]
+    fn resolve_reasoning_config_unprofiled_uses_default() {
+        let config = persisted_with_profiles(json!({
+            "model_profiles": {"*": {"reasoning_effort": {"default": "none"}}}
+        }));
+        let rc = config
+            .resolve_reasoning_config("glm-5.2")
+            .expect("reasoning");
+        assert_eq!(rc.default.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn resolve_reasoning_config_profiled_without_block_gets_none_no_fillin() {
+        let config = persisted_with_profiles(json!({
+            "model_profiles": {
+                "*": {"reasoning_effort": {"default": "none"}},
+                "glm-5.2": {"upstream_model": "glm-5.2-upstream"}
+            }
+        }));
+        assert!(config.resolve_reasoning_config("glm-5.2").is_none());
+    }
+
+    #[test]
+    fn resolve_reasoning_config_chain_first_some_wins() {
+        let config = persisted_with_profiles(json!({
+            "model_profiles": {
+                "glm-5.2-upstream": {"reasoning_effort": {"default": "none"}},
+                "glm-5.2": {"upstream_model": "glm-5.2-upstream", "reasoning_effort": {"default": "max"}}
+            }
+        }));
+        let rc = config
+            .resolve_reasoning_config("glm-5.2")
+            .expect("reasoning");
+        assert_eq!(rc.default.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn resolve_reasoning_config_none_when_no_match_and_no_default() {
+        let config = config_with_profiles(BTreeMap::new());
+        assert!(config.resolve_reasoning_config("glm-5.2").is_none());
     }
 }
