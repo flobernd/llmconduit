@@ -11,253 +11,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
-fn default_true() -> bool {
-    true
-}
-
-/// Thinking modes a profile can advertise for the `thinking` capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThinkingType {
-    Adaptive,
-    Enabled,
-}
-
-impl ThinkingType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ThinkingType::Adaptive => "adaptive",
-            ThinkingType::Enabled => "enabled",
-        }
-    }
-}
-
-/// Reasoning-effort levels a profile can advertise for the `effort` capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EffortLevel {
-    Max,
-    Xhigh,
-    High,
-    Medium,
-    Low,
-    Minimal,
-    // Named `Disabled` (not `None`) so the variant does not shadow `Option::None` lexically;
-    // `rename` keeps the wire format as "none" over the container's `rename_all="lowercase"`.
-    #[serde(rename = "none")]
-    Disabled,
-}
-
-impl EffortLevel {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EffortLevel::Max => "max",
-            EffortLevel::Xhigh => "xhigh",
-            EffortLevel::High => "high",
-            EffortLevel::Medium => "medium",
-            EffortLevel::Low => "low",
-            EffortLevel::Minimal => "minimal",
-            EffortLevel::Disabled => "none",
-        }
-    }
-}
-
-/// Context-management features a profile can advertise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ContextFeature {
-    #[serde(rename = "clear_thinking_20251015")]
-    ClearThinking20251015,
-    #[serde(rename = "clear_tool_uses_20250919")]
-    ClearToolUses20250919,
-    #[serde(rename = "compact_20260112")]
-    Compact20260112,
-}
-
-impl ContextFeature {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ContextFeature::ClearThinking20251015 => "clear_thinking_20251015",
-            ContextFeature::ClearToolUses20250919 => "clear_tool_uses_20250919",
-            ContextFeature::Compact20260112 => "compact_20260112",
-        }
-    }
-}
-
-fn supported_obj(supported: bool) -> JsonValue {
-    let mut map = JsonMap::new();
-    map.insert("supported".to_string(), JsonValue::Bool(supported));
-    JsonValue::Object(map)
-}
-
-/// A capability with only a `supported` flag. A bare bool is shorthand for
-/// `{supported: <bool>}`; an object may omit `supported` (defaults to true).
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
-pub struct SimpleCap {
-    pub supported: bool,
-}
-
-impl SimpleCap {
-    pub fn to_wire(&self) -> JsonValue {
-        supported_obj(self.supported)
-    }
-}
-
-impl<'de> Deserialize<'de> for SimpleCap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        if let Some(supported) = value.as_bool() {
-            return Ok(SimpleCap { supported });
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Raw {
-            #[serde(default = "default_true")]
-            supported: bool,
-        }
-        let raw = serde_json::from_value::<Raw>(value)
-            .map_err(|err| <D::Error as serde::de::Error>::custom(err.to_string()))?;
-        Ok(SimpleCap {
-            supported: raw.supported,
-        })
-    }
-}
-
-/// The `thinking` capability. `types` lists advertised thinking modes; each emitted
-/// type inherits the cap's `supported` flag (one knob, per the capabilities design).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ThinkingCap {
-    #[serde(default = "default_true")]
-    pub supported: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub types: Vec<ThinkingType>,
-}
-
-impl ThinkingCap {
-    pub fn to_wire(&self) -> JsonValue {
-        let mut types = JsonMap::new();
-        for thinking_type in &self.types {
-            types.insert(
-                thinking_type.as_str().to_string(),
-                supported_obj(self.supported),
-            );
-        }
-        let mut map = JsonMap::new();
-        map.insert("supported".to_string(), JsonValue::Bool(self.supported));
-        map.insert("types".to_string(), JsonValue::Object(types));
-        JsonValue::Object(map)
-    }
-}
-
-/// The `effort` capability. `levels` are emitted as siblings of `supported` on the
-/// wire, each inheriting the cap's `supported` flag.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EffortCap {
-    #[serde(default = "default_true")]
-    pub supported: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub levels: Vec<EffortLevel>,
-}
-
-impl EffortCap {
-    pub fn to_wire(&self) -> JsonValue {
-        let mut map = JsonMap::new();
-        map.insert("supported".to_string(), JsonValue::Bool(self.supported));
-        for level in &self.levels {
-            map.insert(level.as_str().to_string(), supported_obj(self.supported));
-        }
-        JsonValue::Object(map)
-    }
-}
-
-/// The `context_management` capability. `features` are emitted as siblings of
-/// `supported`, each inheriting the cap's `supported` flag.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContextManagementCap {
-    #[serde(default = "default_true")]
-    pub supported: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub features: Vec<ContextFeature>,
-}
-
-impl ContextManagementCap {
-    pub fn to_wire(&self) -> JsonValue {
-        let mut map = JsonMap::new();
-        map.insert("supported".to_string(), JsonValue::Bool(self.supported));
-        for feature in &self.features {
-            map.insert(feature.as_str().to_string(), supported_obj(self.supported));
-        }
-        JsonValue::Object(map)
-    }
-}
-
-/// Per-profile Anthropic model capabilities. Only `supported` is a knob (defaulting
-/// to true); configured caps override the base capabilities wholesale per cap key.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilitiesConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub batch: Option<SimpleCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub citations: Option<SimpleCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_execution: Option<SimpleCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_input: Option<SimpleCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pdf_input: Option<SimpleCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub structured_outputs: Option<SimpleCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<ThinkingCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<EffortCap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_management: Option<ContextManagementCap>,
-}
-
-impl CapabilitiesConfig {
-    /// Override configured caps in `base` per cap key, wholesale. Unconfigured caps
-    /// keep their base value.
-    pub fn merge_into(&self, mut base: JsonValue) -> JsonValue {
-        if let Some(map) = base.as_object_mut() {
-            if let Some(cap) = &self.batch {
-                map.insert("batch".to_string(), cap.to_wire());
-            }
-            if let Some(cap) = &self.citations {
-                map.insert("citations".to_string(), cap.to_wire());
-            }
-            if let Some(cap) = &self.code_execution {
-                map.insert("code_execution".to_string(), cap.to_wire());
-            }
-            if let Some(cap) = &self.image_input {
-                map.insert("image_input".to_string(), cap.to_wire());
-            }
-            if let Some(cap) = &self.pdf_input {
-                map.insert("pdf_input".to_string(), cap.to_wire());
-            }
-            if let Some(cap) = &self.structured_outputs {
-                map.insert("structured_outputs".to_string(), cap.to_wire());
-            }
-            if let Some(cap) = &self.thinking {
-                map.insert("thinking".to_string(), cap.to_wire());
-            }
-            if let Some(cap) = &self.effort {
-                map.insert("effort".to_string(), cap.to_wire());
-            }
-            if let Some(cap) = &self.context_management {
-                map.insert("context_management".to_string(), cap.to_wire());
-            }
-        }
-        base
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -271,8 +24,6 @@ pub struct Config {
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
-    /// Per-model profiles keyed by name (case-insensitive lookup). The name `"*"` is
-    /// reserved as the fallback profile for per-model settings that no specific profile covers.
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub brave_base_url: Url,
     pub brave_api_key: Option<String>,
@@ -305,8 +56,6 @@ pub struct PersistedModelProfile {
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<CapabilitiesConfig>,
 }
 
 impl<'de> Deserialize<'de> for PersistedModelProfile {
@@ -326,8 +75,6 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default, flatten)]
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
-            #[serde(default)]
-            capabilities: Option<CapabilitiesConfig>,
         }
 
         let raw = RawPersistedModelProfile::deserialize(deserializer)?;
@@ -338,17 +85,15 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             upstream_model: raw.upstream_model,
             system_prompt_prefix: raw.system_prompt_prefix,
             upstream_chat_kwargs,
-            capabilities: raw.capabilities,
         })
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModelProfile {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    pub capabilities: Option<CapabilitiesConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -645,56 +390,19 @@ impl Config {
         )
     }
 
-    /// Resolve the capabilities config advertised for an upstream model id. A profile
-    /// keyed by the id wins; otherwise the first alias (BTreeMap key order, i.e.
-    /// lexicographically smallest profile key) whose `upstream_model` targets the id
-    /// case-insensitively wins - so among several profiles aliasing the same upstream id
-    /// the lexicographically-smallest profile key is selected, and the reserved `*`
-    /// profile participates in this same tie-break. A matching profile without a
-    /// `capabilities` block yields `None` (no fill-in). If no profile matches, the
-    /// reserved `*` profile's `capabilities` is used.
-    pub fn resolve_capabilities_for_upstream(&self, id: &str) -> Option<&CapabilitiesConfig> {
-        if let Some(profile) = self.model_profile(id) {
-            return profile.capabilities.as_ref();
-        }
-        for profile in self.model_profiles.values() {
-            if profile
-                .upstream_model
-                .as_deref()
-                .map(|upstream| upstream.eq_ignore_ascii_case(id))
-                .unwrap_or(false)
-            {
-                return profile.capabilities.as_ref();
-            }
-        }
-        self.model_profile("*")
-            .and_then(|p| p.capabilities.as_ref())
-    }
-
-    /// Collect profiles matching the request model chain. `resolved_model` must be
-    /// `resolve_upstream_model(request_model)` (callers pass the already-resolved upstream
-    /// id); it is not re-resolved here. The resolved/upstream model is tried first, then the
-    /// request model itself, with pointer-dedup to keep the precedence order stable. The
-    /// reserved `*` profile is a pure fallback: it is included only when no specific profile
-    /// matches, so an explicit match never inherits unset fields from `*` (use profile
-    /// templates to share fields between explicit profiles).
     fn model_profiles_for_resolved_model(
         &self,
         request_model: &str,
         resolved_model: &str,
     ) -> Vec<&ModelProfile> {
         let mut profiles: Vec<&ModelProfile> = Vec::new();
-        for model in [resolved_model, request_model] {
+        let configured_model = self.resolve_upstream_model(request_model);
+        for model in [resolved_model, configured_model.as_str(), request_model] {
             if let Some(profile) = self.model_profile(model)
                 && !profiles
                     .iter()
                     .any(|existing| std::ptr::eq(*existing, profile))
             {
-                profiles.push(profile);
-            }
-        }
-        if profiles.is_empty() {
-            if let Some(profile) = self.model_profile("*") {
                 profiles.push(profile);
             }
         }
@@ -723,7 +431,6 @@ struct ResolvedModelProfile {
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    capabilities: Option<CapabilitiesConfig>,
 }
 
 impl ResolvedModelProfile {
@@ -732,7 +439,6 @@ impl ResolvedModelProfile {
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
             upstream_chat_kwargs: self.upstream_chat_kwargs,
-            capabilities: self.capabilities,
         }
     }
 }
@@ -788,20 +494,12 @@ fn resolve_persisted_model_profile(
     Ok(resolved)
 }
 
-/// Merge a resolved template (`source`) into the accumulating `destination`. The
-/// `capabilities` block overrides wholesale: a child re-specifies a block to replace
-/// the inherited one; omitting it (or writing `null`) does NOT clear an inherited
-/// block - there is no opt-out, only override. Applies to `merge_persisted_model_profile`
-/// below as well.
 fn merge_resolved_model_profile(
     destination: &mut ResolvedModelProfile,
     source: ResolvedModelProfile,
 ) {
     if source.upstream_model.is_some() {
         destination.upstream_model = source.upstream_model;
-    }
-    if source.capabilities.is_some() {
-        destination.capabilities = source.capabilities;
     }
     destination
         .system_prompt_prefixes
@@ -823,9 +521,6 @@ fn merge_persisted_model_profile(
         destination
             .system_prompt_prefixes
             .push(system_prompt_prefix);
-    }
-    if source.capabilities.is_some() {
-        destination.capabilities = source.capabilities.clone();
     }
     merge_json_maps(
         &mut destination.upstream_chat_kwargs,
@@ -1072,18 +767,13 @@ pub fn merge_json_maps(
 
 #[cfg(test)]
 mod tests {
-    use super::CapabilitiesConfig;
     use super::Config;
-    use super::ContextFeature;
-    use super::EffortLevel;
     use super::JsonMap;
     use super::JsonValue;
     use super::PersistedConfig;
     use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
-    use super::SimpleCap;
-    use super::ThinkingCap;
     use super::apply_env_overrides;
     use super::default_config_path;
     use super::default_reasoning_effort;
@@ -1416,17 +1106,20 @@ mod tests {
             model_profile_templates: BTreeMap::from_iter([(
                 "streaming-reasoning".to_string(),
                 PersistedModelProfile {
+                    extends: Vec::new(),
+                    upstream_model: None,
+                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "stream_reasoning".to_string(),
                         JsonValue::Bool(true),
                     )]),
-                    ..Default::default()
                 },
             )]),
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming-reasoning".to_string()],
+                    upstream_model: None,
                     system_prompt_prefix: Some("Use Kimi-compatible behavior.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
@@ -1435,7 +1128,6 @@ mod tests {
                             "preserve_thinking": true
                         }),
                     )]),
-                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1471,6 +1163,9 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
+                    extends: Vec::new(),
+                    upstream_model: None,
+                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
                         json!({
@@ -1478,7 +1173,6 @@ mod tests {
                             "preserve_thinking": true
                         }),
                     )]),
-                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1509,111 +1203,6 @@ mod tests {
     }
 
     #[test]
-    fn star_profile_provides_upstream_chat_kwargs_for_unmatched_model() {
-        let config = Config::from_persisted(&PersistedConfig {
-            bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
-            upstream_api_key: None,
-            upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
-            system_prompt_prefix: None,
-            upstream_request_log_path: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
-            upstream_failure_cooldown_secs: 30,
-            model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
-                "*".to_string(),
-                PersistedModelProfile {
-                    upstream_chat_kwargs: JsonMap::from_iter([(
-                        "chat_template_kwargs".to_string(),
-                        json!({ "enable_thinking": true }),
-                    )]),
-                    ..Default::default()
-                },
-            )]),
-            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
-            brave_api_key: None,
-            brave_max_results: 5,
-            request_timeout_secs: 60,
-            connect_timeout_secs: 10,
-            max_web_search_rounds: 5,
-            flatten_content: true,
-            max_replay_entries: 1000,
-        })
-        .expect("config");
-
-        // No specific profile matches; the reserved `*` profile supplies the kwargs.
-        assert_eq!(
-            config.resolve_upstream_chat_kwargs("unmatched-model"),
-            JsonMap::from_iter([(
-                "chat_template_kwargs".to_string(),
-                json!({ "enable_thinking": true }),
-            )])
-        );
-    }
-
-    #[test]
-    fn explicit_profile_match_does_not_inherit_star_upstream_chat_kwargs() {
-        let config = Config::from_persisted(&PersistedConfig {
-            bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
-            upstream_api_key: None,
-            upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
-            system_prompt_prefix: None,
-            upstream_request_log_path: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
-            upstream_failure_cooldown_secs: 30,
-            model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([
-                (
-                    "*".to_string(),
-                    PersistedModelProfile {
-                        upstream_chat_kwargs: JsonMap::from_iter([(
-                            "chat_template_kwargs".to_string(),
-                            json!({ "enable_thinking": true, "keep_all_reasoning": true }),
-                        )]),
-                        ..Default::default()
-                    },
-                ),
-                (
-                    "glm-5.2".to_string(),
-                    PersistedModelProfile {
-                        upstream_chat_kwargs: JsonMap::from_iter([(
-                            "chat_template_kwargs".to_string(),
-                            json!({ "enable_thinking": false }),
-                        )]),
-                        ..Default::default()
-                    },
-                ),
-            ]),
-            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
-            brave_api_key: None,
-            brave_max_results: 5,
-            request_timeout_secs: 60,
-            connect_timeout_secs: 10,
-            max_web_search_rounds: 5,
-            flatten_content: true,
-            max_replay_entries: 1000,
-        })
-        .expect("config");
-
-        // An explicit match uses only that profile; the `*` profile does not fill in unset
-        // fields (keep_all_reasoning is absent even though `*` sets it).
-        assert_eq!(
-            config.resolve_upstream_chat_kwargs("glm-5.2"),
-            JsonMap::from_iter([(
-                "chat_template_kwargs".to_string(),
-                json!({ "enable_thinking": false }),
-            )])
-        );
-    }
-
-    #[test]
     fn resolves_model_profiles_case_insensitively() {
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
@@ -1631,6 +1220,7 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "MiMo-V2.5".to_string(),
                 PersistedModelProfile {
+                    extends: Vec::new(),
                     upstream_model: Some("mimo-v2.5".to_string()),
                     system_prompt_prefix: Some("Prefer concise answers.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
@@ -1643,7 +1233,6 @@ mod tests {
                             }),
                         ),
                     ]),
-                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1691,6 +1280,8 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "xiaomi/mimo-v2.5-pro".to_string(),
                 PersistedModelProfile {
+                    extends: Vec::new(),
+                    upstream_model: None,
                     system_prompt_prefix: Some("Use MiMo-compatible behavior.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "reasoning".to_string(),
@@ -1698,7 +1289,6 @@ mod tests {
                             "enabled": true
                         }),
                     )]),
-                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1752,6 +1342,8 @@ mod tests {
                 (
                     "xiaomi/mimo-v2.5-pro".to_string(),
                     PersistedModelProfile {
+                        extends: Vec::new(),
+                        upstream_model: None,
                         system_prompt_prefix: Some("Backend prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "reasoning".to_string(),
@@ -1760,12 +1352,13 @@ mod tests {
                                 "effort": "medium"
                             }),
                         )]),
-                        ..Default::default()
                     },
                 ),
                 (
                     "client-default-model".to_string(),
                     PersistedModelProfile {
+                        extends: Vec::new(),
+                        upstream_model: None,
                         system_prompt_prefix: Some("Client prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "reasoning".to_string(),
@@ -1773,7 +1366,6 @@ mod tests {
                                 "effort": "high"
                             }),
                         )]),
-                        ..Default::default()
                     },
                 ),
             ]),
@@ -1825,25 +1417,25 @@ mod tests {
                 (
                     "MiMo-V2.5".to_string(),
                     PersistedModelProfile {
+                        extends: Vec::new(),
                         upstream_model: Some("upper-profile".to_string()),
                         system_prompt_prefix: Some("Upper prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(true),
                         )]),
-                        ..Default::default()
                     },
                 ),
                 (
                     "mimo-v2.5".to_string(),
                     PersistedModelProfile {
+                        extends: Vec::new(),
                         upstream_model: Some("lower-profile".to_string()),
                         system_prompt_prefix: Some("Lower prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(false),
                         )]),
-                        ..Default::default()
                     },
                 ),
             ]),
@@ -1876,8 +1468,10 @@ mod tests {
             model_profiles: BTreeMap::from_iter([(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
+                    extends: Vec::new(),
+                    upstream_model: None,
                     system_prompt_prefix: Some("Profile prefix.".to_string()),
-                    ..Default::default()
+                    upstream_chat_kwargs: JsonMap::new(),
                 },
             )]),
             ..PersistedConfig::default()
@@ -1903,6 +1497,8 @@ mod tests {
                 (
                     "reasoning".to_string(),
                     PersistedModelProfile {
+                        extends: Vec::new(),
+                        upstream_model: None,
                         system_prompt_prefix: Some("Reasoning prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([
                             (
@@ -1922,13 +1518,14 @@ mod tests {
                                 }),
                             ),
                         ]),
-                        ..Default::default()
                     },
                 ),
                 (
                     "streaming".to_string(),
                     PersistedModelProfile {
                         extends: vec!["reasoning".to_string()],
+                        upstream_model: None,
+                        system_prompt_prefix: None,
                         upstream_chat_kwargs: JsonMap::from_iter([
                             ("stream_reasoning".to_string(), JsonValue::Bool(true)),
                             (
@@ -1946,7 +1543,6 @@ mod tests {
                                 }),
                             ),
                         ]),
-                        ..Default::default()
                     },
                 ),
             ]),
@@ -1954,6 +1550,7 @@ mod tests {
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming".to_string()],
+                    upstream_model: None,
                     system_prompt_prefix: Some("Model prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
                         (
@@ -1972,7 +1569,6 @@ mod tests {
                             }),
                         ),
                     ]),
-                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -2061,7 +1657,9 @@ model_profiles:
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["missing".to_string()],
-                    ..Default::default()
+                    upstream_model: None,
+                    system_prompt_prefix: None,
+                    upstream_chat_kwargs: JsonMap::new(),
                 },
             )]),
             ..PersistedConfig::default()
@@ -2079,14 +1677,18 @@ model_profiles:
                     "a".to_string(),
                     PersistedModelProfile {
                         extends: vec!["b".to_string()],
-                        ..Default::default()
+                        upstream_model: None,
+                        system_prompt_prefix: None,
+                        upstream_chat_kwargs: JsonMap::new(),
                     },
                 ),
                 (
                     "b".to_string(),
                     PersistedModelProfile {
                         extends: vec!["a".to_string()],
-                        ..Default::default()
+                        upstream_model: None,
+                        system_prompt_prefix: None,
+                        upstream_chat_kwargs: JsonMap::new(),
                     },
                 ),
             ]),
@@ -2094,7 +1696,9 @@ model_profiles:
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["a".to_string()],
-                    ..Default::default()
+                    upstream_model: None,
+                    system_prompt_prefix: None,
+                    upstream_chat_kwargs: JsonMap::new(),
                 },
             )]),
             ..PersistedConfig::default()
@@ -2223,8 +1827,10 @@ model_profiles:
             model_profiles: BTreeMap::from_iter([(
                 "anthropic/Kimi-K2.6".to_string(),
                 PersistedModelProfile {
+                    extends: Vec::new(),
                     upstream_model: Some("anthropic-custom".to_string()),
-                    ..Default::default()
+                    upstream_chat_kwargs: JsonMap::new(),
+                    system_prompt_prefix: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -2241,254 +1847,6 @@ model_profiles:
         assert_eq!(
             config.resolve_upstream_model("anthropic/Kimi-K2.6"),
             "anthropic-custom"
-        );
-    }
-
-    #[test]
-    fn simple_cap_accepts_bool_shorthand() {
-        assert_eq!(
-            serde_json::from_value::<SimpleCap>(json!(true)).unwrap(),
-            SimpleCap { supported: true }
-        );
-        assert_eq!(
-            serde_json::from_value::<SimpleCap>(json!(false)).unwrap(),
-            SimpleCap { supported: false }
-        );
-    }
-
-    #[test]
-    fn simple_cap_object_supported_defaults_true() {
-        assert_eq!(
-            serde_json::from_value::<SimpleCap>(json!({})).unwrap(),
-            SimpleCap { supported: true }
-        );
-        assert_eq!(
-            serde_json::from_value::<SimpleCap>(json!({"supported": false})).unwrap(),
-            SimpleCap { supported: false }
-        );
-    }
-
-    #[test]
-    fn simple_cap_rejects_unknown_keys() {
-        assert!(serde_json::from_value::<SimpleCap>(json!({"supported": true, "x": 1})).is_err());
-    }
-
-    #[test]
-    fn capabilities_reject_unknown_cap_key() {
-        assert!(serde_json::from_value::<CapabilitiesConfig>(json!({"bogus": {}})).is_err());
-    }
-
-    #[test]
-    fn effort_cap_rejects_unknown_level() {
-        assert!(
-            serde_json::from_value::<CapabilitiesConfig>(json!({"effort": {"levels": ["turbo"]}}))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn thinking_cap_rejects_unknown_type() {
-        assert!(
-            serde_json::from_value::<CapabilitiesConfig>(json!({"thinking": {"types": ["bogus"]}}))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn context_management_rejects_unknown_feature() {
-        assert!(
-            serde_json::from_value::<CapabilitiesConfig>(
-                json!({"context_management": {"features": ["nope"]}})
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn effort_cap_supported_defaults_true() {
-        let caps: CapabilitiesConfig =
-            serde_json::from_value(json!({"effort": {"levels": ["max"]}})).expect("parse");
-        let effort = caps.effort.unwrap();
-        assert!(effort.supported);
-        assert_eq!(effort.levels, vec![EffortLevel::Max]);
-    }
-
-    #[test]
-    fn capabilities_to_wire_thinking() {
-        let caps: CapabilitiesConfig =
-            serde_json::from_value(json!({"thinking": {"types": ["adaptive", "enabled"]}}))
-                .expect("parse");
-        assert_eq!(
-            caps.thinking.unwrap().to_wire(),
-            json!({
-                "supported": true,
-                "types": {
-                    "adaptive": {"supported": true},
-                    "enabled": {"supported": true}
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn thinking_cap_to_wire_empty_types() {
-        let cap = ThinkingCap {
-            supported: true,
-            types: vec![],
-        };
-        assert_eq!(cap.to_wire(), json!({"supported": true, "types": {}}));
-    }
-
-    #[test]
-    fn capabilities_to_wire_effort_levels_are_siblings_of_supported() {
-        let caps: CapabilitiesConfig =
-            serde_json::from_value(json!({"effort": {"levels": ["max", "medium", "none"]}}))
-                .expect("parse");
-        assert_eq!(
-            caps.effort.unwrap().to_wire(),
-            json!({
-                "supported": true,
-                "max": {"supported": true},
-                "medium": {"supported": true},
-                "none": {"supported": true}
-            })
-        );
-    }
-
-    #[test]
-    fn capabilities_to_wire_context_management() {
-        let caps: CapabilitiesConfig = serde_json::from_value(json!({
-            "context_management": {"features": ["clear_thinking_20251015", "compact_20260112"]}
-        }))
-        .expect("parse");
-        assert_eq!(
-            caps.context_management.unwrap().to_wire(),
-            json!({
-                "supported": true,
-                "clear_thinking_20251015": {"supported": true},
-                "compact_20260112": {"supported": true}
-            })
-        );
-    }
-
-    #[test]
-    fn capabilities_to_wire_simple_caps() {
-        let caps: CapabilitiesConfig = serde_json::from_value(json!({
-            "batch": true,
-            "image_input": {"supported": false}
-        }))
-        .expect("parse");
-        assert_eq!(caps.batch.unwrap().to_wire(), json!({"supported": true}));
-        assert_eq!(
-            caps.image_input.unwrap().to_wire(),
-            json!({"supported": false})
-        );
-    }
-
-    #[test]
-    fn capabilities_to_wire_supported_false_propagates_to_children() {
-        let caps: CapabilitiesConfig =
-            serde_json::from_value(json!({"effort": {"supported": false, "levels": ["max"]}}))
-                .expect("parse");
-        assert_eq!(
-            caps.effort.unwrap().to_wire(),
-            json!({
-                "supported": false,
-                "max": {"supported": false}
-            })
-        );
-    }
-
-    #[test]
-    fn capabilities_merge_into_overrides_configured_caps_only() {
-        let base = json!({
-            "thinking": {"supported": false, "types": {"adaptive": {"supported": false}}},
-            "effort": {"supported": false, "max": {"supported": false}},
-            "image_input": {"supported": false}
-        });
-        let caps: CapabilitiesConfig =
-            serde_json::from_value(json!({"thinking": {"types": ["enabled"]}})).expect("parse");
-        let merged = caps.merge_into(base);
-        assert_eq!(
-            merged["thinking"],
-            json!({
-                "supported": true,
-                "types": {"enabled": {"supported": true}}
-            })
-        );
-        // Unconfigured caps keep the base value (wholesale, no fill-in).
-        assert_eq!(merged["effort"]["supported"], false);
-        assert_eq!(merged["image_input"]["supported"], false);
-    }
-
-    #[test]
-    fn context_feature_roundtrips_through_serde() {
-        let feature: ContextFeature =
-            serde_json::from_value(json!("clear_tool_uses_20250919")).expect("parse");
-        assert_eq!(feature.as_str(), "clear_tool_uses_20250919");
-    }
-
-    fn persisted_with_profiles(profiles: serde_json::Value) -> Config {
-        let mut root = serde_json::Map::new();
-        root.insert(
-            "upstream_base_url".to_string(),
-            json!("http://127.0.0.1:8000/v1"),
-        );
-        if let serde_json::Value::Object(map) = profiles {
-            for (key, value) in map {
-                root.insert(key, value);
-            }
-        }
-        let persisted: PersistedConfig =
-            serde_json::from_value(serde_json::Value::Object(root)).expect("parse config");
-        Config::from_persisted(&persisted).expect("config")
-    }
-
-    #[test]
-    fn resolve_capabilities_id_keyed_wins() {
-        let config = persisted_with_profiles(json!({
-            "model_profiles": {"glm-5.2": {"capabilities": {"thinking": {"types": ["adaptive"]}}}}
-        }));
-        let caps = config
-            .resolve_capabilities_for_upstream("glm-5.2")
-            .expect("caps");
-        assert!(caps.thinking.is_some());
-    }
-
-    #[test]
-    fn resolve_capabilities_alias_target_matches() {
-        let config = persisted_with_profiles(json!({
-            "model_profiles": {"glm-alias": {"upstream_model": "glm-5.2", "capabilities": {"effort": {"levels": ["max"]}}}}
-        }));
-        let caps = config
-            .resolve_capabilities_for_upstream("glm-5.2")
-            .expect("caps");
-        assert!(caps.effort.is_some());
-    }
-
-    #[test]
-    fn resolve_capabilities_unprofiled_uses_default() {
-        let config = persisted_with_profiles(json!({
-            "model_profiles": {"*": {"capabilities": {"thinking": {"types": ["adaptive"]}}}}
-        }));
-        let caps = config
-            .resolve_capabilities_for_upstream("unknown-id")
-            .expect("caps");
-        assert!(caps.thinking.is_some());
-    }
-
-    #[test]
-    fn resolve_capabilities_profiled_without_block_gets_none_no_fillin() {
-        let config = persisted_with_profiles(json!({
-            "model_profiles": {
-                "*": {"capabilities": {"thinking": {"types": ["adaptive"]}}},
-                "glm-5.2": {"upstream_model": "glm-5.2-upstream"}
-            }
-        }));
-        assert!(
-            config
-                .resolve_capabilities_for_upstream("glm-5.2")
-                .is_none()
         );
     }
 }

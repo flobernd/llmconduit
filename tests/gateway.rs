@@ -915,6 +915,8 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             model_profiles: std::collections::BTreeMap::from([(
                 "Kimi-K2.6".to_string(),
                 llmconduit::config::ModelProfile {
+                    upstream_model: None,
+                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
                         json!({
@@ -922,7 +924,6 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                             "preserve_thinking": true
                         }),
                     )]),
-                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -963,8 +964,9 @@ async fn prepends_profile_system_prompt_prefix_for_responses_requests() {
     config.model_profiles = std::collections::BTreeMap::from([(
         "glm-5.1".to_string(),
         llmconduit::config::ModelProfile {
+            upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
-            ..Default::default()
+            upstream_chat_kwargs: JsonMap::new(),
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -2543,7 +2545,23 @@ async fn response_completed_carries_matched_stop_sequence() {
     upstream
         .push_response(vec![
             Ok(content_chunk("chat-1", "hello")),
-            Ok(stop_sequence_chunk("chat-1", "</block>")),
+            Ok(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        function_call: None,
+                        refusal: None,
+                        extra: Default::default(),
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    stop_reason: Some(json!("</block>")),
+                }],
+                usage: None,
+            }),
         ])
         .await;
     let gateway = test_gateway(upstream, MockSearch::default());
@@ -3048,26 +3066,6 @@ fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> Chat
             },
             finish_reason: Some("tool_calls".to_string()),
             stop_reason: None,
-        }],
-        usage: None,
-    }
-}
-
-fn stop_sequence_chunk(id: &str, stop: &str) -> ChatCompletionChunk {
-    ChatCompletionChunk {
-        id: id.to_string(),
-        choices: vec![ChatChunkChoice {
-            index: 0,
-            delta: ChatDelta {
-                content: None,
-                reasoning_content: None,
-                tool_calls: None,
-                function_call: None,
-                refusal: None,
-                extra: Default::default(),
-            },
-            finish_reason: Some("stop".to_string()),
-            stop_reason: Some(json!(stop)),
         }],
         usage: None,
     }
@@ -3851,6 +3849,8 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
     config.model_profiles = std::collections::BTreeMap::from([(
         "client-model".to_string(),
         llmconduit::config::ModelProfile {
+            upstream_model: None,
+            system_prompt_prefix: None,
             upstream_chat_kwargs: JsonMap::from_iter([(
                 "chat_template_kwargs".to_string(),
                 json!({
@@ -3858,7 +3858,6 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                     "shared": "model"
                 }),
             )]),
-            ..Default::default()
         },
     )]);
 
@@ -4384,8 +4383,9 @@ async fn chat_completions_prepends_profile_system_prompt_prefix() {
     config.model_profiles = std::collections::BTreeMap::from([(
         "glm-5.1".to_string(),
         llmconduit::config::ModelProfile {
+            upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
-            ..Default::default()
+            upstream_chat_kwargs: JsonMap::new(),
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -4538,7 +4538,23 @@ async fn anthropic_messages_surfaces_stop_sequence_reason_when_stop_string_match
     upstream
         .push_response(vec![
             Ok(content_chunk("chat-1", "Hello")),
-            Ok(stop_sequence_chunk("chat-1", "</block>")),
+            Ok(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        function_call: None,
+                        refusal: None,
+                        extra: Default::default(),
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    stop_reason: Some(json!("</block>")),
+                }],
+                usage: None,
+            }),
         ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
@@ -5011,8 +5027,9 @@ async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
     config.model_profiles = std::collections::BTreeMap::from([(
         "claude-3-5-sonnet-20241022".to_string(),
         llmconduit::config::ModelProfile {
+            upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
-            ..Default::default()
+            upstream_chat_kwargs: JsonMap::new(),
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -5100,7 +5117,23 @@ async fn anthropic_messages_non_streaming_surfaces_stop_sequence_reason() {
     upstream
         .push_response(vec![
             Ok(content_chunk("chat-1", "Hello")),
-            Ok(stop_sequence_chunk("chat-1", "</block>")),
+            Ok(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        function_call: None,
+                        refusal: None,
+                        extra: Default::default(),
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    stop_reason: Some(json!("</block>")),
+                }],
+                usage: None,
+            }),
         ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
@@ -6025,129 +6058,4 @@ async fn count_tokens_malformed_body_returns_400() {
         .expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(body["error"]["type"], "invalid_request_error");
-}
-
-#[tokio::test]
-async fn anthropic_models_advertise_thinking_capabilities_for_glm_profiles() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "glm-5.2"}, {"id": "qwen3"}]
-        })))
-        .mount(&server)
-        .await;
-
-    let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "glm-5.2".to_string(),
-        llmconduit::config::ModelProfile {
-            capabilities: Some(
-                serde_json::from_value::<llmconduit::config::CapabilitiesConfig>(json!({
-                    "thinking": {"types": ["enabled"]},
-                    "effort": {"levels": ["medium", "xhigh"]}
-                }))
-                .expect("caps"),
-            ),
-            ..Default::default()
-        },
-    )]);
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .header("anthropic-version", "2023-06-01")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    let models = body["data"].as_array().expect("data array");
-    let glm = models
-        .iter()
-        .find(|model| model["id"] == "glm-5.2")
-        .expect("glm-5.2 entry");
-    assert_eq!(glm["capabilities"]["thinking"]["supported"], true);
-    assert_eq!(
-        glm["capabilities"]["thinking"]["types"]["enabled"]["supported"],
-        true
-    );
-    assert_eq!(glm["capabilities"]["effort"]["supported"], true);
-    assert_eq!(glm["capabilities"]["effort"]["medium"]["supported"], true);
-    assert_eq!(glm["capabilities"]["effort"]["xhigh"]["supported"], true);
-    let qwen = models
-        .iter()
-        .find(|model| model["id"] == "qwen3")
-        .expect("qwen3 entry");
-    assert_eq!(qwen["capabilities"]["thinking"]["supported"], false);
-    assert_eq!(qwen["capabilities"]["effort"]["supported"], false);
-}
-
-#[tokio::test]
-async fn anthropic_models_advertise_glm_capabilities_for_alias_targeting_upstream() {
-    // The GLM profile is keyed by a client alias that targets the upstream id;
-    // /v1/models lists the upstream id, not the alias. The advertised upstream
-    // entry must still show GLM capabilities because a profile resolves to it.
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "glm-5.2"}, {"id": "qwen3"}]
-        })))
-        .mount(&server)
-        .await;
-
-    let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "client-glm".to_string(),
-        llmconduit::config::ModelProfile {
-            upstream_model: Some("glm-5.2".to_string()),
-            capabilities: Some(
-                serde_json::from_value::<llmconduit::config::CapabilitiesConfig>(json!({
-                    "thinking": {"types": ["adaptive"]},
-                    "effort": {"levels": ["max"]}
-                }))
-                .expect("caps"),
-            ),
-            ..Default::default()
-        },
-    )]);
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .header("anthropic-version", "2023-06-01")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    let models = body["data"].as_array().expect("data array");
-    let glm = models
-        .iter()
-        .find(|model| model["id"] == "glm-5.2")
-        .expect("glm-5.2 entry");
-    assert_eq!(glm["capabilities"]["thinking"]["supported"], true);
-    assert_eq!(glm["capabilities"]["effort"]["supported"], true);
-    let qwen = models
-        .iter()
-        .find(|model| model["id"] == "qwen3")
-        .expect("qwen3 entry");
-    assert_eq!(qwen["capabilities"]["thinking"]["supported"], false);
 }
