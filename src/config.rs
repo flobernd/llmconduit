@@ -23,7 +23,8 @@ fn default_true() -> bool {
 /// upstreams default it on when the kwarg is absent, so on the Anthropic path the gateway always
 /// injects an explicit thinking template kwarg (`thinking_param_name`, default `enable_thinking`)
 /// set to `thinking_param_value_on`/`_off`. A `default` effort that leaks through while thinking
-/// is off is then ignored by the upstream.
+/// is off is then ignored by the upstream. The `*` rewrite is applied in
+/// `adapters::responses_to_chat::lower_request_with_reasoning_config`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReasoningConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,11 +60,11 @@ fn is_default_thinking_param_name(name: &str) -> bool {
 }
 
 fn is_default_thinking_param_value_on(value: &JsonValue) -> bool {
-    *value == default_thinking_param_value_on()
+    matches!(value, JsonValue::Bool(true))
 }
 
 fn is_default_thinking_param_value_off(value: &JsonValue) -> bool {
-    *value == default_thinking_param_value_off()
+    matches!(value, JsonValue::Bool(false))
 }
 
 impl Default for ReasoningConfig {
@@ -175,7 +176,10 @@ pub enum EffortLevel {
     Medium,
     Low,
     Minimal,
-    None,
+    // Named `Disabled` (not `None`) so the variant does not shadow `Option::None` lexically;
+    // `rename` keeps the wire format as "none" over the container's `rename_all="lowercase"`.
+    #[serde(rename = "none")]
+    Disabled,
 }
 
 impl EffortLevel {
@@ -187,7 +191,7 @@ impl EffortLevel {
             EffortLevel::Medium => "medium",
             EffortLevel::Low => "low",
             EffortLevel::Minimal => "minimal",
-            EffortLevel::None => "none",
+            EffortLevel::Disabled => "none",
         }
     }
 }
@@ -539,9 +543,9 @@ pub struct PersistedConfig {
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
-    // Migration guard: the top-level `default_reasoning_effort` knob was removed
-    // (use the reserved `default` profile's `reasoning_effort.default` instead). Capture any
-    // stray value and reject it in from_persisted so old configs fail fast.
+    // Migration guard: reject stray top-level `default_reasoning_effort` so old configs fail
+    // fast; route default effort through the reserved `default` profile's
+    // `reasoning_effort.default` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -677,6 +681,15 @@ impl Config {
                     .to_string(),
             );
         }
+        if let Ok(value) = env::var("LLMCONDUIT_DEFAULT_REASONING_EFFORT")
+            && !value.trim().is_empty()
+        {
+            return Err(
+                "`LLMCONDUIT_DEFAULT_REASONING_EFFORT` was removed; set `reasoning_effort.default` \
+                 on the reserved `default` model profile instead"
+                    .to_string(),
+            );
+        }
         let fallback_upstreams = config
             .fallback_upstreams
             .iter()
@@ -779,8 +792,11 @@ impl Config {
     }
 
     /// Resolve the capabilities config advertised for an upstream model id. A profile
-    /// keyed by the id wins; otherwise the first alias (BTreeMap order) whose
-    /// `upstream_model` targets the id case-insensitively. A matching profile without a
+    /// keyed by the id wins; otherwise the first alias (BTreeMap key order, i.e.
+    /// lexicographically smallest profile key) whose `upstream_model` targets the id
+    /// case-insensitively wins - so among several profiles aliasing the same upstream id
+    /// the lexicographically-smallest profile key is selected, and the reserved `default`
+    /// profile participates in this same tie-break. A matching profile without a
     /// `capabilities` block yields `None` (no fill-in). If no profile matches, the
     /// reserved `default` profile's `capabilities` is used.
     pub fn resolve_capabilities_for_upstream(&self, id: &str) -> Option<&CapabilitiesConfig> {
@@ -817,14 +833,17 @@ impl Config {
         )
     }
 
+    /// Collect profiles matching the request model chain. `resolved_model` must be
+    /// `resolve_upstream_model(request_model)` (callers pass the already-resolved upstream
+    /// id); it is not re-resolved here. The resolved/upstream model is tried first, then the
+    /// request model itself, with pointer-dedup to keep the precedence order stable.
     fn model_profiles_for_resolved_model(
         &self,
         request_model: &str,
         resolved_model: &str,
     ) -> Vec<&ModelProfile> {
         let mut profiles: Vec<&ModelProfile> = Vec::new();
-        let configured_model = self.resolve_upstream_model(request_model);
-        for model in [resolved_model, configured_model.as_str(), request_model] {
+        for model in [resolved_model, request_model] {
             if let Some(profile) = self.model_profile(model)
                 && !profiles
                     .iter()
@@ -918,6 +937,11 @@ fn resolve_persisted_model_profile(
     Ok(resolved)
 }
 
+/// Merge a resolved template (`source`) into the accumulating `destination`. Blocks
+/// (`reasoning_effort`, `capabilities`) override wholesale: a child re-specifies a block to
+/// replace the inherited one; omitting it (or writing `null`) does NOT clear an inherited
+/// block - there is no opt-out, only override. Applies to `merge_persisted_model_profile`
+/// below as well.
 fn merge_resolved_model_profile(
     destination: &mut ResolvedModelProfile,
     source: ResolvedModelProfile,
@@ -1210,6 +1234,7 @@ mod tests {
     use super::EffortLevel;
     use super::ReasoningConfig;
     use super::SimpleCap;
+    use super::ThinkingCap;
     use super::apply_env_overrides;
     use super::default_config_path;
     use super::load_persisted_config;
@@ -1281,6 +1306,10 @@ mod tests {
         assert!(
             err.contains("default_reasoning_effort"),
             "error should name the removed knob: {err}"
+        );
+        assert!(
+            err.contains("reasoning_effort.default"),
+            "error should name the replacement: {err}"
         );
     }
 
@@ -2440,6 +2469,15 @@ model_profiles:
                 }
             })
         );
+    }
+
+    #[test]
+    fn thinking_cap_to_wire_empty_types() {
+        let cap = ThinkingCap {
+            supported: true,
+            types: vec![],
+        };
+        assert_eq!(cap.to_wire(), json!({"supported": true, "types": {}}));
     }
 
     #[test]
