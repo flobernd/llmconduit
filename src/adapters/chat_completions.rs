@@ -37,8 +37,6 @@ pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesReq
             effort: Some(effort),
             summary: None,
         }),
-        // Chat Completions clients control the upstream thinking kwarg directly via extra_body.
-        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -972,7 +970,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
-            parallel_tool_calls: false,
+            parallel_tool_calls: None,
             reasoning_effort: None,
             response_format: None,
             stream_options: None,

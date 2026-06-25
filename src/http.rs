@@ -792,41 +792,34 @@ async fn handle_count_tokens(
     // Mirror the generation path: the configured system-prompt prefix is part
     // of the real upstream prompt, so it must be counted here too.
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
-    let reasoning_config = gateway.config().resolve_reasoning_config(&original_model);
-    let lowered = crate::adapters::responses_to_chat::lower_request_with_reasoning_config(
+    let lowered = crate::adapters::responses_to_chat::lower_request_with_default_reasoning_effort(
         &responses_request,
         Vec::new(),
-        reasoning_config,
+        &gateway.config().default_reasoning_effort,
     )?;
-    // Mirror the generation path: this is the Anthropic route, so inject the explicit thinking
-    // template kwarg (it changes the rendered template, hence the token count), and let a
-    // resolved effort of `none` force thinking off just as the streaming path does.
-    let thinking_on = crate::engine::anthropic_thinking_on(
-        responses_request.thinking.unwrap_or(false),
-        lowered.reasoning_effort.as_deref(),
+    // Mirror build_upstream_extra_body: start from the profile's resolved passthrough
+    // chat_template_kwargs (operator template kwargs affect rendering, so they must be counted).
+    // Typed defaults are folded into the named chat fields by the generation path and don't
+    // belong in the tokenize body, so only the passthrough map is carried over here.
+    let passthrough_kwargs = crate::engine::extract_passthrough_kwargs(
+        gateway
+            .config()
+            .resolve_upstream_chat_kwargs_for_resolved_model(&original_model, &resolved_model),
     );
-    let (thinking_name, thinking_value) =
-        crate::engine::resolve_thinking_kwarg(reasoning_config, thinking_on);
-    // Mirror build_upstream_extra_body: start from the profile's resolved
-    // chat_template_kwargs (operator template kwargs affect rendering, so they
-    // must be counted), then inject the thinking kwarg on top so it overrides
-    // any static default.
-    let mut chat_template_kwargs = match gateway
-        .config()
-        .resolve_upstream_chat_kwargs_for_resolved_model(&original_model, &resolved_model)
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), Value::String(resolved_model));
+    body.insert(
+        "messages".to_string(),
+        serde_json::to_value(&lowered.messages).unwrap_or(Value::Null),
+    );
+    if let Value::Object(map) = passthrough_kwargs
         .get("chat_template_kwargs")
         .cloned()
         .unwrap_or(Value::Null)
     {
-        Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-    chat_template_kwargs.insert(thinking_name, thinking_value);
-    let body = serde_json::json!({
-        "model": resolved_model,
-        "messages": lowered.messages,
-        "chat_template_kwargs": chat_template_kwargs,
-    });
+        body.insert("chat_template_kwargs".to_string(), Value::Object(map));
+    }
+    let body = Value::Object(body);
 
     match gateway.upstream_client().count_tokens(&body).await {
         Ok(Some(count)) => {
