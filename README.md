@@ -135,9 +135,10 @@ works and overrides the shorthand when both set the same key.
 A profile's `reasoning_effort` block shapes the upstream `reasoning_effort` field
 (the value Claude Code sends as `output_config.effort`, and the value OpenAI
 clients send as `reasoning_effort`) and controls the thinking template kwarg the
-gateway injects on the Anthropic route. It applies on every converting route
-(`/v1/messages`, `/v1/responses`, `/v1/chat/completions`, and
-`/v1/messages/count_tokens`).
+gateway injects on the Anthropic route. Effort shaping applies on every
+converting route (`/v1/messages`, `/v1/responses`, `/v1/chat/completions`, and
+`/v1/messages/count_tokens`); the thinking-template-kwarg injection applies only
+on the Anthropic routes (`/v1/messages` and `/v1/messages/count_tokens`).
 
 ```yaml
 model_profiles:
@@ -210,8 +211,10 @@ model_profiles:
   are rejected at load.
 - A configured cap replaces the base (upstream-supplied, else the default
   capabilities) for that cap key, wholesale; unconfigured caps keep the base.
-  Caps resolve per upstream id: an id-keyed profile, else the first alias whose
-  `upstream_model` targets the id, else the `default` profile.
+  As with `reasoning_effort`, a matched profile without a `capabilities` block
+  gets no fill-in from the `default` profile. Caps resolve per upstream id: an
+  id-keyed profile, else the first alias whose `upstream_model` targets the id,
+  else the `default` profile.
 
 ### Example: GLM-5.2 on vLLM
 
