@@ -150,9 +150,6 @@ fn build_upstream_extra_body(
     extra_body
 }
 
-/// Resolve the thinking template kwarg (name + value) to inject for the Anthropic path. Falls
-/// back to the built-in `enable_thinking` = true/false when the profile has no `reasoning_effort`
-/// block, so the intent is always stated explicitly to the upstream.
 /// Whether to inject thinking-on on the Anthropic route. The request's thinking field is the
 /// primary signal, but a resolved effort of `none` (the canonical "skip thinking" level that the
 /// z.ai/GLM clamp maps `minimal`/`none` to) must turn thinking off even when the request enabled
@@ -161,6 +158,9 @@ pub(crate) fn anthropic_thinking_on(requested_on: bool, resolved_effort: Option<
     requested_on && !resolved_effort.is_some_and(|effort| effort.eq_ignore_ascii_case("none"))
 }
 
+/// Resolve the thinking template kwarg (name + value) to inject for the Anthropic path. Falls
+/// back to the built-in `enable_thinking` = true/false when the profile has no `reasoning_effort`
+/// block, so the intent is always stated explicitly to the upstream.
 pub(crate) fn resolve_thinking_kwarg(
     reasoning_config: Option<&ReasoningConfig>,
     on: bool,
@@ -181,7 +181,7 @@ pub(crate) fn resolve_thinking_kwarg(
     )
 }
 
-fn inject_chat_template_kwarg(
+pub(crate) fn inject_chat_template_kwarg(
     extra_body: &mut BTreeMap<String, Value>,
     name: String,
     value: Value,
@@ -198,7 +198,10 @@ fn inject_chat_template_kwarg(
     }
 }
 
-// Must stay in sync with the keys extracted in extract_typed_defaults.
+// Must stay in sync with the keys extracted in extract_typed_defaults. `thinking` is reserved
+// because it's the internal Anthropic-route kwarg name (set by the adapter onto the skip field);
+// a client-supplied `thinking` on /v1/responses falls through `extra_body` via flatten and must
+// not reach the upstream, so it's dropped here rather than forwarded.
 fn is_reserved_upstream_key(key: &str) -> bool {
     matches!(
         key,
@@ -212,6 +215,7 @@ fn is_reserved_upstream_key(key: &str) -> bool {
             | "max_completion_tokens"
             | "frequency_penalty"
             | "presence_penalty"
+            | "thinking"
     )
 }
 
@@ -233,7 +237,7 @@ struct UpstreamTypedDefaults {
     parallel_tool_calls: Option<bool>,
 }
 
-fn extract_typed_defaults(
+pub(crate) fn extract_typed_defaults(
     mut map: serde_json::Map<String, Value>,
 ) -> (UpstreamTypedDefaults, serde_json::Map<String, Value>) {
     let mut defaults = UpstreamTypedDefaults::default();

@@ -808,7 +808,24 @@ async fn handle_count_tokens(
     );
     let (thinking_name, thinking_value) =
         crate::engine::resolve_thinking_kwarg(reasoning_config, thinking_on);
-    let mut chat_template_kwargs = serde_json::Map::new();
+    // Mirror build_upstream_extra_body: start from the profile's resolved passthrough
+    // chat_template_kwargs (operator template kwargs affect rendering, so they must be counted),
+    // then inject the thinking kwarg on top so it overrides any static default. Typed defaults
+    // are folded into the named chat fields by the generation path and don't belong in the
+    // tokenize body, so only the passthrough map is carried over here.
+    let (_, passthrough_kwargs) = crate::engine::extract_typed_defaults(
+        gateway
+            .config()
+            .resolve_upstream_chat_kwargs_for_resolved_model(&original_model, &resolved_model),
+    );
+    let mut chat_template_kwargs = match passthrough_kwargs
+        .get("chat_template_kwargs")
+        .cloned()
+        .unwrap_or(Value::Null)
+    {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
     chat_template_kwargs.insert(thinking_name, thinking_value);
     let body = serde_json::json!({
         "model": resolved_model,

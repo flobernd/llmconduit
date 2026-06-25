@@ -45,8 +45,10 @@ pub struct ResponsesRequest {
     pub reasoning: Option<ReasoningRequest>,
     /// Anthropic-path explicit thinking on/off decision, used to inject the upstream thinking
     /// template kwarg (e.g. `enable_thinking`). `None` on routes where the client controls that
-    /// kwarg directly (chat completions, native responses). `skip` keeps it internal: clients
-    /// cannot set it and it is never serialized.
+    /// kwarg directly (chat completions, native responses). `skip` keeps it internal: the field is
+    /// set by the Anthropic adapter and never serialized, and a client-supplied `thinking` on the
+    /// Responses route is dropped from `extra_body` by the reserved-key check in
+    /// `build_upstream_extra_body`, so it never reaches the upstream.
     #[serde(skip)]
     pub thinking: Option<bool>,
     #[serde(default = "default_store_true")]
