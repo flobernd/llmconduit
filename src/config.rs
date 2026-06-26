@@ -127,6 +127,7 @@ impl Action {
 pub enum When {
     Leading,
     Inline,
+    Always,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
