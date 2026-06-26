@@ -915,8 +915,6 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             model_profiles: std::collections::BTreeMap::from([(
                 "Kimi-K2.6".to_string(),
                 llmconduit::config::ModelProfile {
-                    upstream_model: None,
-                    system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "chat_template_kwargs".to_string(),
                         json!({
@@ -924,6 +922,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                             "preserve_thinking": true
                         }),
                     )]),
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -964,9 +963,8 @@ async fn prepends_profile_system_prompt_prefix_for_responses_requests() {
     config.model_profiles = std::collections::BTreeMap::from([(
         "glm-5.1".to_string(),
         llmconduit::config::ModelProfile {
-            upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
-            upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -3808,8 +3806,6 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
     config.model_profiles = std::collections::BTreeMap::from([(
         "client-model".to_string(),
         llmconduit::config::ModelProfile {
-            upstream_model: None,
-            system_prompt_prefix: None,
             upstream_chat_kwargs: JsonMap::from_iter([(
                 "chat_template_kwargs".to_string(),
                 json!({
@@ -3817,6 +3813,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                     "shared": "model"
                 }),
             )]),
+            ..Default::default()
         },
     )]);
 
@@ -4342,9 +4339,8 @@ async fn chat_completions_prepends_profile_system_prompt_prefix() {
     config.model_profiles = std::collections::BTreeMap::from([(
         "glm-5.1".to_string(),
         llmconduit::config::ModelProfile {
-            upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
-            upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -4912,9 +4908,8 @@ async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
     config.model_profiles = std::collections::BTreeMap::from([(
         "claude-3-5-sonnet-20241022".to_string(),
         llmconduit::config::ModelProfile {
-            upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
-            upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
