@@ -3,8 +3,9 @@ use crate::adapters::chat_to_responses::ResolvedToolCall;
 use crate::adapters::chat_to_responses::StreamEmission;
 use crate::adapters::chat_to_responses::StreamState;
 use crate::adapters::responses_to_chat::ToolKind;
-use crate::adapters::responses_to_chat::lower_request_with_default_reasoning_effort;
+use crate::adapters::responses_to_chat::lower_request_with_reasoning_config;
 use crate::config::Config;
+use crate::config::ReasoningConfig;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionChunk;
@@ -128,70 +129,154 @@ impl UpstreamModelCatalog {
 fn build_upstream_extra_body(
     defaults: serde_json::Map<String, Value>,
     request: &ResponsesRequest,
-    response_format: &Option<Value>,
-    reasoning_effort: &Option<String>,
+    thinking_kwarg: Option<(String, Value)>,
 ) -> BTreeMap<String, Value> {
-    let mut extra_body = defaults.into_iter().collect();
-    remove_defaults_for_explicit_request_fields(
-        &mut extra_body,
-        request,
-        response_format,
-        reasoning_effort,
-    );
-    remove_defaults_shadowed_by_request_extra(&mut extra_body, &request.extra_body);
+    let mut extra_body: BTreeMap<String, Value> = defaults.into_iter().collect();
     for (key, value) in &request.extra_body {
+        // Reserved keys are serialized from the named ChatCompletionRequest fields
+        // (resolved in run_turn). Merging them from the client's extra_body would
+        // duplicate the key, so the named field stays the single source of truth.
+        if is_reserved_upstream_key(key) {
+            continue;
+        }
         merge_request_extra_value(&mut extra_body, key, value);
+    }
+    // Anthropic treats thinking as off unless the request enables it, but some upstreams
+    // default it on when the kwarg is absent. So state it explicitly here; injected last to
+    // override any static `chat_template_kwargs` default rather than relying on `reasoning_effort`.
+    if let Some((name, value)) = thinking_kwarg {
+        inject_chat_template_kwarg(&mut extra_body, name, value);
     }
     extra_body
 }
 
-fn remove_defaults_for_explicit_request_fields(
+/// Whether to inject thinking-on on the Anthropic route. The request's thinking field is the
+/// primary signal, but a resolved effort of `none` (the canonical "skip thinking" level that the
+/// z.ai/GLM clamp maps `minimal`/`none` to) must turn thinking off even when the request enabled
+/// it - otherwise the clamp would be silently ineffective.
+pub(crate) fn anthropic_thinking_on(requested_on: bool, resolved_effort: Option<&str>) -> bool {
+    requested_on && !resolved_effort.is_some_and(|effort| effort.eq_ignore_ascii_case("none"))
+}
+
+/// Resolve the thinking template kwarg (name + value) to inject for the Anthropic path. Falls
+/// back to the built-in `enable_thinking` = true/false when the profile has no `reasoning_effort`
+/// block, so the intent is always stated explicitly to the upstream.
+pub(crate) fn resolve_thinking_kwarg(
+    reasoning_config: Option<&ReasoningConfig>,
+    on: bool,
+) -> (String, Value) {
+    // Borrow the resolved config when present; otherwise fall back to the config defaults so the
+    // injected name/value never drift from a profile that omits the `reasoning_effort` block.
+    let owned_defaults;
+    let rc = match reasoning_config {
+        Some(rc) => rc,
+        None => {
+            owned_defaults = ReasoningConfig::default();
+            &owned_defaults
+        }
+    };
+    (
+        rc.thinking_param_name.clone(),
+        rc.thinking_param_value(on).clone(),
+    )
+}
+
+fn inject_chat_template_kwarg(
     extra_body: &mut BTreeMap<String, Value>,
-    request: &ResponsesRequest,
-    response_format: &Option<Value>,
-    reasoning_effort: &Option<String>,
+    name: String,
+    value: Value,
 ) {
-    if request.temperature.is_some() {
-        remove_keys(extra_body, &["temperature"]);
+    let entry = extra_body
+        .entry("chat_template_kwargs".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    // A non-object default would swallow the kwarg; replace it with a fresh object.
+    if !entry.is_object() {
+        *entry = Value::Object(serde_json::Map::new());
     }
-    if request.top_p.is_some() {
-        remove_keys(extra_body, &["top_p"]);
-    }
-    if request.max_output_tokens.is_some() {
-        remove_keys(
-            extra_body,
-            &["max_tokens", "max_output_tokens", "max_completion_tokens"],
-        );
-    }
-    if request.frequency_penalty.is_some() {
-        remove_keys(extra_body, &["frequency_penalty"]);
-    }
-    if request.presence_penalty.is_some() {
-        remove_keys(extra_body, &["presence_penalty"]);
-    }
-    if response_format.is_some() {
-        remove_keys(extra_body, &["response_format"]);
-    }
-    if reasoning_effort.is_some() {
-        remove_keys(extra_body, &["reasoning_effort"]);
+    if let Value::Object(map) = entry {
+        map.insert(name, value);
     }
 }
 
-fn remove_defaults_shadowed_by_request_extra(
-    extra_body: &mut BTreeMap<String, Value>,
-    request_extra: &BTreeMap<String, Value>,
-) {
-    for aliases in [&["max_tokens", "max_output_tokens", "max_completion_tokens"][..]] {
-        if aliases.iter().any(|key| request_extra.contains_key(*key)) {
-            remove_keys(extra_body, aliases);
+// Must stay in sync with the keys extracted in extract_typed_defaults. `thinking` is reserved
+// because it's the internal Anthropic-route kwarg name (set by the adapter onto the skip field);
+// a client-supplied `thinking` on /v1/responses falls through `extra_body` via flatten and must
+// not reach the upstream, so it's dropped here rather than forwarded.
+fn is_reserved_upstream_key(key: &str) -> bool {
+    matches!(
+        key,
+        "parallel_tool_calls"
+            | "reasoning_effort"
+            | "response_format"
+            | "temperature"
+            | "top_p"
+            | "max_tokens"
+            | "max_output_tokens"
+            | "max_completion_tokens"
+            | "frequency_penalty"
+            | "presence_penalty"
+            | "thinking"
+    )
+}
+
+/// Typed defaults pulled out of `upstream_chat_kwargs` and resolved into the named
+/// `ChatCompletionRequest` fields. Keeping them out of the flattened `extra_body` map
+/// prevents a key serializing twice (named field plus map), which is how the duplicate
+/// `parallel_tool_calls` upstream key arose. Keys with no typed counterpart stay in the
+/// passthrough map. A default whose value has the wrong type is dropped rather than passed
+/// through raw, to preserve the single-key invariant.
+#[derive(Default)]
+struct UpstreamTypedDefaults {
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_output_tokens: Option<i64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    response_format: Option<Value>,
+    reasoning_effort: Option<String>,
+    parallel_tool_calls: Option<bool>,
+}
+
+/// Passthrough portion of `upstream_chat_kwargs` after typed defaults are extracted, for
+/// `/v1/messages/count_tokens` to mirror the generation path's `chat_template_kwargs` without
+/// exposing the typed-defaults struct.
+pub(crate) fn extract_passthrough_kwargs(
+    map: serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    extract_typed_defaults(map).1
+}
+
+fn extract_typed_defaults(
+    mut map: serde_json::Map<String, Value>,
+) -> (UpstreamTypedDefaults, serde_json::Map<String, Value>) {
+    let mut defaults = UpstreamTypedDefaults::default();
+    if let Some(v) = map.remove("temperature") {
+        defaults.temperature = serde_json::from_value(v).ok();
+    }
+    if let Some(v) = map.remove("top_p") {
+        defaults.top_p = serde_json::from_value(v).ok();
+    }
+    for alias in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+        if let Some(v) = map.remove(alias) {
+            defaults.max_output_tokens = serde_json::from_value(v).ok();
         }
     }
-}
-
-fn remove_keys(extra_body: &mut BTreeMap<String, Value>, keys: &[&str]) {
-    for key in keys {
-        extra_body.remove(*key);
+    if let Some(v) = map.remove("frequency_penalty") {
+        defaults.frequency_penalty = serde_json::from_value(v).ok();
     }
+    if let Some(v) = map.remove("presence_penalty") {
+        defaults.presence_penalty = serde_json::from_value(v).ok();
+    }
+    if let Some(v) = map.remove("response_format") {
+        defaults.response_format = serde_json::from_value(v).ok();
+    }
+    if let Some(v) = map.remove("reasoning_effort") {
+        defaults.reasoning_effort = serde_json::from_value(v).ok();
+    }
+    if let Some(v) = map.remove("parallel_tool_calls") {
+        defaults.parallel_tool_calls = serde_json::from_value(v).ok();
+    }
+    (defaults, map)
 }
 
 fn merge_request_extra_value(extra_body: &mut BTreeMap<String, Value>, key: &str, value: &Value) {
@@ -326,18 +411,25 @@ impl Gateway {
                 );
             }
         }
+        let reasoning_config = self.config.resolve_reasoning_config(&tail_request.model);
         let roles = self
             .config
             .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
-        let lowered = lower_request_with_default_reasoning_effort(
+        let lowered = lower_request_with_reasoning_config(
             &tail_request,
             baseline_record
                 .as_ref()
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
-            &self.config.default_reasoning_effort,
+            reasoning_config,
             roles,
         )?;
+        // Only the Anthropic path sets `thinking`; other routes leave the upstream thinking
+        // kwarg to the client. A resolved effort of `none` also forces thinking off.
+        let thinking_kwarg = request.thinking.map(|on| {
+            let on = anthropic_thinking_on(on, lowered.reasoning_effort.as_deref());
+            resolve_thinking_kwarg(reasoning_config, on)
+        });
 
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
@@ -352,6 +444,7 @@ impl Gateway {
                     lowered.tool_registry,
                     lowered.response_format,
                     lowered.reasoning_effort,
+                    thinking_kwarg,
                     resolved_model,
                     tx.clone(),
                 )
@@ -427,6 +520,7 @@ impl Gateway {
         tool_registry: crate::adapters::responses_to_chat::ToolRegistry,
         response_format: Option<Value>,
         reasoning_effort: Option<String>,
+        thinking_kwarg: Option<(String, Value)>,
         upstream_model: String,
         tx: mpsc::Sender<SseEvent>,
     ) -> AppResult<()> {
@@ -717,13 +811,13 @@ impl Gateway {
         let mut current_tool_choice = request.tool_choice.clone();
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
-        let upstream_extra_body = build_upstream_extra_body(
+        #[allow(unused_assignments)]
+        let mut last_stop_sequence: Option<String> = None;
+        let (typed_defaults, passthrough_kwargs) = extract_typed_defaults(
             self.config
                 .resolve_upstream_chat_kwargs_for_resolved_model(&request.model, &upstream_model),
-            &request,
-            &response_format,
-            &reasoning_effort,
         );
+        let upstream_extra_body = build_upstream_extra_body(passthrough_kwargs, &request, thinking_kwarg);
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
         loop {
             if tx.is_closed() {
@@ -737,17 +831,27 @@ impl Gateway {
                 stream: true,
                 tools: (!tools.is_empty()).then_some(tools.clone()),
                 tool_choice: Some(current_tool_choice.clone()),
-                parallel_tool_calls: false,
-                reasoning_effort: reasoning_effort.clone(),
-                response_format: response_format.clone(),
+                parallel_tool_calls: request
+                    .parallel_tool_calls
+                    .or(typed_defaults.parallel_tool_calls),
+                reasoning_effort: reasoning_effort
+                    .clone()
+                    .or(typed_defaults.reasoning_effort.clone()),
+                response_format: response_format
+                    .clone()
+                    .or(typed_defaults.response_format.clone()),
                 stream_options: Some(StreamOptions {
                     include_usage: true,
                 }),
-                temperature: request.temperature,
-                top_p: request.top_p,
-                max_output_tokens: request.max_output_tokens,
-                frequency_penalty: request.frequency_penalty,
-                presence_penalty: request.presence_penalty,
+                temperature: request.temperature.or(typed_defaults.temperature),
+                top_p: request.top_p.or(typed_defaults.top_p),
+                max_output_tokens: request
+                    .max_output_tokens
+                    .or(typed_defaults.max_output_tokens),
+                frequency_penalty: request
+                    .frequency_penalty
+                    .or(typed_defaults.frequency_penalty),
+                presence_penalty: request.presence_penalty.or(typed_defaults.presence_penalty),
                 stop: normalized_stop.clone(),
                 extra_body: upstream_extra_body.clone(),
             };
@@ -1016,6 +1120,7 @@ impl Gateway {
             }
             let finalized = state.finalize(&tool_registry)?;
             last_finish_reason = finalized.finish_reason.clone();
+            last_stop_sequence = finalized.stop_sequence.clone();
             current_messages = upstream_request.messages;
             self.emit_completed_public_items(
                 &response_id,
@@ -1114,6 +1219,7 @@ impl Gateway {
             } else {
                 None
             },
+            stop_sequence: last_stop_sequence,
         };
         if self.monitor.is_enabled() {
             let final_preview = preview_json_limited_with_images(&resource, 128 * 1024);

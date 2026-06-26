@@ -4,6 +4,7 @@ use crate::adapters::chat_completions::ChatCompletionCollector;
 use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
+use crate::config::Config;
 use crate::debug_ui::debug_index;
 use crate::debug_ui::debug_ws;
 use crate::engine::Gateway;
@@ -792,19 +793,54 @@ async fn handle_count_tokens(
     // Mirror the generation path: the configured system-prompt prefix is part
     // of the real upstream prompt, so it must be counted here too.
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
+    let reasoning_config = gateway.config().resolve_reasoning_config(&original_model);
     let roles = gateway
         .config()
         .resolve_roles_config_for_resolved_model(&original_model, &resolved_model);
-    let lowered = crate::adapters::responses_to_chat::lower_request_with_default_reasoning_effort(
+    let lowered = crate::adapters::responses_to_chat::lower_request_with_reasoning_config(
         &responses_request,
         Vec::new(),
-        &gateway.config().default_reasoning_effort,
+        reasoning_config,
         roles,
     )?;
-    let body = serde_json::json!({
-        "model": resolved_model,
-        "messages": lowered.messages,
-    });
+    // Mirror the generation path: this is the Anthropic route, so inject the explicit thinking
+    // template kwarg (it changes the rendered template, hence the token count), and let a
+    // resolved effort of `none` force thinking off just as the streaming path does.
+    let thinking_on = crate::engine::anthropic_thinking_on(
+        responses_request.thinking.unwrap_or(false),
+        lowered.reasoning_effort.as_deref(),
+    );
+    let (thinking_name, thinking_value) =
+        crate::engine::resolve_thinking_kwarg(reasoning_config, thinking_on);
+    // Mirror build_upstream_extra_body: start from the profile's resolved passthrough
+    // chat_template_kwargs (operator template kwargs affect rendering, so they must be counted).
+    // Typed defaults are folded into the named chat fields by the generation path and don't
+    // belong in the tokenize body, so only the passthrough map is carried over here.
+    let passthrough_kwargs = crate::engine::extract_passthrough_kwargs(
+        gateway
+            .config()
+            .resolve_upstream_chat_kwargs_for_resolved_model(&original_model, &resolved_model),
+    );
+    let mut chat_template_kwargs = match passthrough_kwargs
+        .get("chat_template_kwargs")
+        .cloned()
+        .unwrap_or(Value::Null)
+    {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    chat_template_kwargs.insert(thinking_name, thinking_value);
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), Value::String(resolved_model));
+    body.insert(
+        "messages".to_string(),
+        serde_json::to_value(&lowered.messages).unwrap_or(Value::Null),
+    );
+    body.insert(
+        "chat_template_kwargs".to_string(),
+        Value::Object(chat_template_kwargs),
+    );
+    let body = Value::Object(body);
 
     match gateway.upstream_client().count_tokens(&body).await {
         Ok(Some(count)) => {
@@ -1076,7 +1112,7 @@ async fn get_models(
     let response = gateway.upstream_client().list_models().await?;
     let (status, body, etag) = collect_models_response(response).await?;
     let body = if anthropic_models {
-        transform_models_response_for_anthropic(body, &query)?
+        transform_models_response_for_anthropic(body, &query, gateway.config())?
     } else {
         body
     };
@@ -1098,6 +1134,7 @@ fn is_anthropic_models_request(headers: &HeaderMap) -> bool {
 fn transform_models_response_for_anthropic(
     body: Value,
     query: &ModelsListQuery,
+    config: &Config,
 ) -> AppResult<Value> {
     if query.after_id.is_some() && query.before_id.is_some() {
         return Err(AppError::bad_request(
@@ -1108,7 +1145,7 @@ fn transform_models_response_for_anthropic(
     let limit = parse_anthropic_models_limit(query.limit.as_deref())?;
     let models = extract_model_entries(&body)
         .into_iter()
-        .filter_map(|entry| anthropic_model_entry(&entry))
+        .filter_map(|entry| anthropic_model_entry(&entry, config))
         .collect::<Vec<_>>();
 
     let (page, has_more) = page_anthropic_models(&models, query, limit)?;
@@ -1159,10 +1196,11 @@ fn extract_model_entries(body: &Value) -> Vec<Value> {
     }
 }
 
-fn anthropic_model_entry(entry: &Value) -> Option<Value> {
+fn anthropic_model_entry(entry: &Value, config: &Config) -> Option<Value> {
     match entry {
         Value::String(id) => {
             let caps = infer_capabilities_from_model_id(id);
+            let caps = merge_configured_capabilities(config, id, caps);
             Some(build_anthropic_model_entry(
                 id,
                 id,
@@ -1196,6 +1234,7 @@ fn anthropic_model_entry(entry: &Value) -> Option<Value> {
                 .filter(|value| value.is_object())
                 .map(Value::clone)
                 .unwrap_or_else(|| infer_capabilities_from_model_id(id));
+            let capabilities = merge_configured_capabilities(config, id, capabilities);
 
             Some(build_anthropic_model_entry(
                 id,
@@ -1230,6 +1269,17 @@ fn parse_created_at(map: &serde_json::Map<String, Value>) -> Option<String> {
 
 fn infer_capabilities_from_model_id(_id: &str) -> Value {
     default_anthropic_model_capabilities()
+}
+
+/// Override the base capabilities with any `capabilities` block configured on the
+/// profile that resolves to this upstream id (id-keyed, else an alias whose
+/// `upstream_model` targets the id, else the reserved `*` profile). Unconfigured
+/// caps keep the base value; configured caps replace the base per cap key, wholesale.
+fn merge_configured_capabilities(config: &Config, id: &str, base: Value) -> Value {
+    match config.resolve_capabilities_for_upstream(id) {
+        Some(caps) => caps.merge_into(base),
+        None => base,
+    }
 }
 
 fn build_anthropic_model_entry(
