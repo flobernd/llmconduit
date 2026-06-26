@@ -794,10 +794,14 @@ async fn handle_count_tokens(
     // of the real upstream prompt, so it must be counted here too.
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let reasoning_config = gateway.config().resolve_reasoning_config(&original_model);
+    let roles = gateway
+        .config()
+        .resolve_roles_config_for_resolved_model(&original_model, &resolved_model);
     let lowered = crate::adapters::responses_to_chat::lower_request_with_reasoning_config(
         &responses_request,
         Vec::new(),
         reasoning_config,
+        roles,
     )?;
     // Mirror the generation path: this is the Anthropic route, so inject the explicit thinking
     // template kwarg (it changes the rendered template, hence the token count), and let a

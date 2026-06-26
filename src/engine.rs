@@ -412,6 +412,9 @@ impl Gateway {
             }
         }
         let reasoning_config = self.config.resolve_reasoning_config(&tail_request.model);
+        let roles = self
+            .config
+            .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
         let lowered = lower_request_with_reasoning_config(
             &tail_request,
             baseline_record
@@ -419,6 +422,7 @@ impl Gateway {
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
             reasoning_config,
+            roles,
         )?;
         // Only the Anthropic path sets `thinking`; other routes leave the upstream thinking
         // kwarg to the client. A resolved effort of `none` also forces thinking off.
