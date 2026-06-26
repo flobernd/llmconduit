@@ -58,7 +58,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         input,
         tools,
         tool_choice,
-        parallel_tool_calls: None,
+        parallel_tool_calls: false,
         reasoning,
         store: false,
         stream: true,

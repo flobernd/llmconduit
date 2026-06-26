@@ -970,7 +970,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
-            parallel_tool_calls: None,
+            parallel_tool_calls: false,
             reasoning_effort: None,
             response_format: None,
             stream_options: None,

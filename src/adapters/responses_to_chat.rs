@@ -907,7 +907,7 @@ mod tests {
             input: vec![],
             tools: vec![],
             tool_choice: serde_json::Value::String("auto".to_string()),
-            parallel_tool_calls: None,
+            parallel_tool_calls: false,
             reasoning: None,
             store: false,
             stream: true,
