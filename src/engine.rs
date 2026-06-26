@@ -326,6 +326,9 @@ impl Gateway {
                 );
             }
         }
+        let roles = self
+            .config
+            .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
         let lowered = lower_request_with_default_reasoning_effort(
             &tail_request,
             baseline_record
@@ -333,6 +336,7 @@ impl Gateway {
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
             &self.config.default_reasoning_effort,
+            roles,
         )?;
 
         let (tx, rx) = mpsc::channel(128);
