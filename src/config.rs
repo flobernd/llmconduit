@@ -671,20 +671,24 @@ impl Config {
             .and_then(|p| p.capabilities.as_ref())
     }
 
-    /// Collect profiles matching the request model chain. `resolved_model` must be
-    /// `resolve_upstream_model(request_model)` (callers pass the already-resolved upstream
-    /// id); it is not re-resolved here. The resolved/upstream model is tried first, then the
-    /// request model itself, with pointer-dedup to keep the precedence order stable. The
-    /// reserved `*` profile is a pure fallback: it is included only when no specific profile
-    /// matches, so an explicit match never inherits unset fields from `*` (use profile
+    /// Collect profiles matching the request model chain. `resolved_model` is the
+    /// catalog-normalized backend id (callers pass `normalize_upstream_model(resolve_upstream_model(
+    /// request_model))`); it is not re-resolved here. The pre-normalization upstream alias -
+    /// `resolve_upstream_model(request_model)` - is also tried, because a profile may be keyed by
+    /// that alias before normalization collapses it to the backend id. Lookup order is
+    /// [resolved_model, alias, request_model], with pointer-dedup to keep the precedence order
+    /// stable. The reserved `*` profile is a pure fallback: it is included only when no specific
+    /// profile matches, so an explicit match never inherits unset fields from `*` (use profile
     /// templates to share fields between explicit profiles).
     fn model_profiles_for_resolved_model(
         &self,
         request_model: &str,
         resolved_model: &str,
     ) -> Vec<&ModelProfile> {
+        // resolve_upstream_model returns String; borrow as &str so every chain entry shares one type.
+        let upstream_alias = self.resolve_upstream_model(request_model);
         let mut profiles: Vec<&ModelProfile> = Vec::new();
-        for model in [resolved_model, request_model] {
+        for model in [resolved_model, upstream_alias.as_str(), request_model] {
             if let Some(profile) = self.model_profile(model)
                 && !profiles
                     .iter()
@@ -1803,6 +1807,67 @@ mod tests {
                 .resolve_system_prompt_prefix("client-default-model")
                 .as_deref(),
             Some("Client prefix.")
+        );
+    }
+
+    #[test]
+    fn alias_keyed_profile_applies_when_resolved_model_is_normalized() {
+        // Callers pass the catalog-normalized backend id as resolved_model, which can differ
+        // from the pre-normalization upstream alias a profile is keyed by. The lookup chain must
+        // still find the alias-keyed profile; otherwise its kwargs silently drop.
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
+            system_prompt_prefix: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            upstreams: Vec::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
+            model_profile_templates: BTreeMap::new(),
+            model_profiles: BTreeMap::from_iter([
+                (
+                    "client-model".to_string(),
+                    PersistedModelProfile {
+                        upstream_model: Some("provider/alias-model".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "provider/alias-model".to_string(),
+                    PersistedModelProfile {
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "stream_reasoning".to_string(),
+                            JsonValue::Bool(true),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        // The catalog-normalized backend id differs from the alias the profile is keyed by.
+        let normalized = "provider/alias-model-v2";
+        assert_eq!(
+            config.resolve_upstream_model("client-model"),
+            "provider/alias-model"
+        );
+        assert_ne!(normalized, config.resolve_upstream_model("client-model"));
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs_for_resolved_model("client-model", normalized),
+            JsonMap::from_iter([("stream_reasoning".to_string(), JsonValue::Bool(true))])
         );
     }
 
